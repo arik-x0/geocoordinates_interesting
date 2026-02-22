@@ -5,6 +5,9 @@ RGB satellite images, using NDBI-derived pseudo-labels as ground truth.
 """
 
 import argparse
+import json
+import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -138,10 +141,16 @@ def train(args):
     best_val_iou = 0.0
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_path = checkpoint_dir / "training_log.json"
+
+    epoch_logs: list = []
+    training_start = time.time()
 
     print(f"\n--- Training for {args.epochs} epochs ---\n")
+    print(f"  Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
         print(f"Epoch {epoch}/{args.epochs}")
 
         train_loss, train_iou, train_dice = train_one_epoch(
@@ -154,11 +163,19 @@ def train(args):
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
 
+        epoch_duration = time.time() - epoch_start
+        elapsed        = time.time() - training_start
+        remaining_epochs = args.epochs - epoch
+        eta_s          = (elapsed / epoch) * remaining_epochs
+        eta_str        = f"{int(eta_s // 60)}m {int(eta_s % 60):02d}s"
+
         print(f"  Train — Loss: {train_loss:.4f} | IoU: {train_iou:.4f} | Dice: {train_dice:.4f}")
         print(f"  Val   — Loss: {val_loss:.4f} | IoU: {val_iou:.4f} | Dice: {val_dice:.4f}")
         print(f"  LR: {current_lr:.6f}")
+        print(f"  Time: {epoch_duration:.1f}s | Elapsed: {elapsed/60:.1f}m | ETA: {eta_str}")
 
-        if val_iou > best_val_iou:
+        is_best = val_iou > best_val_iou
+        if is_best:
             best_val_iou = val_iou
             save_path = checkpoint_dir / "best_model.pth"
             torch.save({
@@ -171,7 +188,29 @@ def train(args):
             }, save_path)
             print(f"  ** New best model saved (IoU: {val_iou:.4f}) **")
 
+        epoch_logs.append({
+            "epoch":            epoch,
+            "timestamp":        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "epoch_duration_s": round(epoch_duration, 2),
+            "elapsed_s":        round(elapsed, 2),
+            "train_loss":       round(train_loss, 6),
+            "train_iou":        round(train_iou, 6),
+            "train_dice":       round(train_dice, 6),
+            "val_loss":         round(val_loss, 6),
+            "val_iou":          round(val_iou, 6),
+            "val_dice":         round(val_dice, 6),
+            "lr":               current_lr,
+            "is_best":          is_best,
+        })
+        with open(log_path, "w") as f:
+            json.dump(epoch_logs, f, indent=2)
+
         print()
+
+    total_time = time.time() - training_start
+    print(f"Training complete in {total_time/60:.1f}m ({total_time:.0f}s).")
+    print(f"Best validation IoU: {best_val_iou:.4f}")
+    print(f"Epoch log saved to:  {log_path}")
 
     final_path = checkpoint_dir / "final_model.pth"
     torch.save({
@@ -180,7 +219,6 @@ def train(args):
         "optimizer_state_dict": optimizer.state_dict(),
     }, final_path)
 
-    print(f"Training complete. Best validation IoU: {best_val_iou:.4f}")
     print(f"Models saved to: {checkpoint_dir}")
 
 
