@@ -1,6 +1,6 @@
 """
 Inference and greenery ranking script.
-Loads a trained U-Net, runs segmentation on test images, computes
+Loads a trained TransUNet, runs segmentation on test images, computes
 greenery scores, ranks images by greenery dominance, and saves
 visualizations.
 """
@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from model import UNet
+from model import TransUNet
 from dataset import get_dataloaders
 from utils import (
     greenery_score_from_prediction,
@@ -127,7 +127,7 @@ def main(args):
     print(f"Using device: {device}")
 
     # Load model
-    model = UNet(in_channels=3, out_channels=1).to(device)
+    model = TransUNet(in_channels=3, out_channels=1).to(device)
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():

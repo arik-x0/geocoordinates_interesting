@@ -1,7 +1,7 @@
 """
-Training script for the satellite greenery segmentation U-Net.
+Training script for the satellite greenery segmentation TransUNet.
 Downloads EuroSAT, generates NDVI ground-truth masks, and trains
-the model to segment greenery from desert-like areas.
+the hybrid Transformer + U-Net model to segment greenery from desert-like areas.
 """
 
 import argparse
@@ -13,7 +13,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from model import UNet, count_parameters
+from model import TransUNet, count_parameters
 from dataset import get_dataloaders
 
 
@@ -123,8 +123,8 @@ def train(args):
     )
 
     # Model
-    model = UNet(in_channels=3, out_channels=1).to(device)
-    print(f"\nU-Net initialized: {count_parameters(model):,} trainable parameters")
+    model = TransUNet(in_channels=3, out_channels=1).to(device)
+    print(f"\nTransUNet initialized: {count_parameters(model):,} trainable parameters")
 
     # Training setup
     criterion = DiceBCELoss(dice_weight=0.5)
@@ -183,7 +183,7 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train greenery segmentation U-Net on EuroSAT")
+    parser = argparse.ArgumentParser(description="Train greenery segmentation ViT on EuroSAT")
     parser.add_argument("--data-dir", type=str, default="data",
                         help="Directory to download/find EuroSAT dataset")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints",

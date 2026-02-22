@@ -1,6 +1,6 @@
 """
 Inference and POI ranking script for elevation-based cliff-water detection.
-Loads a trained model, runs segmentation, ranks images by POI intensity,
+Loads a trained TransUNet, runs segmentation, ranks images by POI intensity,
 and saves heatmap visualizations.
 """
 

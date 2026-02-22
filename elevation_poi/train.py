@@ -1,7 +1,7 @@
 """
-Training script for the elevation POI detection U-Net.
-Trains the model to predict cliff-near-water heatmaps from
-6-channel satellite + DEM input.
+Training script for the elevation POI detection TransUNet.
+Trains the hybrid Transformer + U-Net model to predict cliff-near-water
+heatmaps from 6-channel satellite + DEM input.
 """
 
 import argparse
@@ -133,7 +133,7 @@ def train(args):
 
     # Model
     model = ElevationPOIUNet(in_channels=6, out_channels=1).to(device)
-    print(f"\nElevation POI U-Net: {count_parameters(model):,} trainable parameters")
+    print(f"\nElevation POI TransUNet: {count_parameters(model):,} trainable parameters")
     print(f"Input channels: RGB(3) + DEM(1) + Slope(1) + Aspect(1) = 6")
 
     # Training setup
@@ -191,7 +191,7 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train elevation POI detection U-Net")
+    parser = argparse.ArgumentParser(description="Train elevation POI detection ViT")
     parser.add_argument("--data-dir", type=str, default="data",
                         help="Directory for EuroSAT + SRTM data")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints",
