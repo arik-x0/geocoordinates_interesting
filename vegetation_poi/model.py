@@ -351,6 +351,27 @@ class TransUNet(nn.Module):
         x = self.final_conv(x)                   # (B,   1, 64, 64)
         return torch.sigmoid(x)
 
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract a fixed-size image embedding from the Transformer bottleneck.
+
+        Runs the CNN encoder and Transformer bottleneck, then mean-pools the
+        8x8 spatial feature map to a single (B, 512) vector per image.
+        Vectors are L2-normalised so inner product equals cosine similarity,
+        making them directly usable with a FAISS IndexFlatIP index.
+
+        Call within torch.no_grad() during indexing and retrieval.
+
+        Returns:
+            (B, 512) L2-normalised float32 embedding tensor.
+        """
+        skip1 = self.enc1(x)
+        skip2 = self.enc2(self.pool(skip1))
+        skip3 = self.enc3(self.pool(skip2))
+        bottleneck = self.enc4(self.pool(skip3))          # (B, 512, 8, 8)
+        bottleneck = self.transformer(bottleneck)          # (B, 512, 8, 8)
+        emb = bottleneck.mean(dim=[2, 3])                 # (B, 512) spatial mean-pool
+        return nn.functional.normalize(emb, p=2, dim=1)   # L2-normalise
+
 
 # ── Utilities ────────────────────────────────────────────────────────────────
 
