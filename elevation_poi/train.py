@@ -18,7 +18,7 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-from model import ElevationPOIUNet, count_parameters
+from model import ElevationPOITransUNet, count_parameters
 from dataset import get_dataloaders
 
 
@@ -180,7 +180,7 @@ def train(args):
         water_threshold=args.water_threshold,
     )
 
-    model = ElevationPOIUNet(in_channels=6, out_channels=1).to(device)
+    model = ElevationPOITransUNet(in_channels=6, out_channels=1).to(device)
     print(f"\nElevation POI TransUNet: {count_parameters(model):,} trainable parameters")
     print(f"Input channels: RGB(3) + DEM(1) + Slope(1) + Aspect(1) = 6")
 

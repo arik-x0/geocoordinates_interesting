@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from model import ElevationPOIUNet
+from model import ElevationPOITransUNet
 from dataset import get_dataloaders
 from utils import (
     compute_poi_score,
@@ -235,7 +235,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = ElevationPOIUNet(in_channels=6, out_channels=1).to(device)
+    model = ElevationPOITransUNet(in_channels=6, out_channels=1).to(device)
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():

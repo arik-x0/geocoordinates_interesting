@@ -375,10 +375,6 @@ class ElevationPOITransUNet(nn.Module):
         return nn.functional.normalize(emb, p=2, dim=1)   # L2-normalise
 
 
-# Alias — train.py / predict.py import ElevationPOIUNet; now resolves to TransUNet
-ElevationPOIUNet = ElevationPOITransUNet
-
-
 # ── Utilities ────────────────────────────────────────────────────────────────
 
 def count_parameters(model: nn.Module) -> int:
