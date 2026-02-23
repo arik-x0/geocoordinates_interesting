@@ -62,30 +62,99 @@ class DiceBCELoss(nn.Module):
         return (1 - self.dice_weight) * bce_loss + self.dice_weight * dice_loss
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
-    """Train for one epoch. Returns average loss, IoU, and Dice."""
+class NTXentLoss(nn.Module):
+    """NT-Xent (InfoNCE) contrastive loss over a batch of L2-normalised embeddings.
+
+    Positive pairs: images sharing the same EuroSAT class name in the batch.
+    Negative pairs: all other images in the batch.
+
+    Because model.encode() already returns L2-normalised vectors, inner product
+    equals cosine similarity, so no extra normalisation is needed here.
+
+    Loss for anchor i:
+        -1/|P_i| * Σ_{p∈P_i} [ sim(i,p)/τ  −  log Σ_{j≠i} exp(sim(i,j)/τ) ]
+
+    When there are no positive pairs for an anchor (its class appears only once
+    in the batch) that anchor is skipped — its loss contribution is zero.
+    """
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, embeddings: torch.Tensor, class_names: list) -> torch.Tensor:
+        B      = embeddings.size(0)
+        device = embeddings.device
+
+        # Cosine similarity matrix (B, B) — embeddings are L2-normalised
+        sim = torch.mm(embeddings, embeddings.T) / self.temperature
+
+        # Build positive mask: True where i and j share the same class
+        unique_classes = list(set(class_names))
+        class_to_idx   = {c: i for i, c in enumerate(unique_classes)}
+        label_ids = torch.tensor(
+            [class_to_idx[c] for c in class_names], dtype=torch.long, device=device
+        )
+        pos_mask = (label_ids.unsqueeze(0) == label_ids.unsqueeze(1))  # (B, B)
+        pos_mask.fill_diagonal_(False)
+
+        if not pos_mask.any():
+            return embeddings.sum() * 0.0   # differentiable zero
+
+        # Denominator: log Σ_{j≠i} exp(sim(i,j)/τ)  — exclude self
+        self_mask   = torch.eye(B, dtype=torch.bool, device=device)
+        log_denom   = torch.logsumexp(sim.masked_fill(self_mask, float("-inf")), dim=1)
+
+        losses = []
+        for i in range(B):
+            pos_idx = pos_mask[i].nonzero(as_tuple=True)[0]
+            if len(pos_idx) == 0:
+                continue
+            loss_i = -(sim[i, pos_idx] - log_denom[i]).mean()
+            losses.append(loss_i)
+
+        return torch.stack(losses).mean()
+
+
+def train_one_epoch(model, loader, criterion, contrastive_criterion,
+                    contrastive_weight, optimizer, device):
+    """Train for one epoch.
+
+    Returns:
+        (total_loss, seg_loss, contra_loss, iou, dice) — all batch-averaged.
+    """
     model.train()
-    total_loss = total_iou = total_dice = 0.0
+    total_loss = total_seg = total_contra = total_iou = total_dice = 0.0
     n_batches = 0
 
     pbar = tqdm(loader, desc="  Train", leave=False)
-    for rgb, masks, _meta in pbar:
+    for rgb, masks, meta in pbar:
         rgb   = rgb.to(device)
         masks = masks.to(device)
 
         optimizer.zero_grad()
-        predictions = model(rgb)
-        loss = criterion(predictions, masks)
+        # Single forward pass — encoder runs once, embedding comes for free
+        predictions, embeddings = model(rgb, return_embedding=True)
+        seg_loss    = criterion(predictions, masks)
+
+        # Contrastive loss on the bottleneck embeddings (no extra encoder pass)
+        class_names  = [m["class_name"] for m in meta]
+        contra_loss  = contrastive_criterion(embeddings, class_names)
+
+        loss = seg_loss + contrastive_weight * contra_loss
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
-        total_iou  += compute_iou(predictions.detach(), masks)
-        total_dice += compute_dice(predictions.detach(), masks)
-        n_batches  += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        total_loss   += loss.item()
+        total_seg    += seg_loss.item()
+        total_contra += contra_loss.item()
+        total_iou    += compute_iou(predictions.detach(), masks)
+        total_dice   += compute_dice(predictions.detach(), masks)
+        n_batches    += 1
+        pbar.set_postfix(loss=f"{loss.item():.4f}", ctr=f"{contra_loss.item():.4f}")
 
-    return total_loss / n_batches, total_iou / n_batches, total_dice / n_batches
+    n = n_batches
+    return total_loss / n, total_seg / n, total_contra / n, total_iou / n, total_dice / n
 
 
 @torch.no_grad()
@@ -179,9 +248,11 @@ def train(args):
     model = TransUNet(in_channels=3, out_channels=1).to(device)
     print(f"\nTransUNet initialized: {count_parameters(model):,} trainable parameters")
 
-    criterion = DiceBCELoss(dice_weight=0.5)
+    criterion             = DiceBCELoss(dice_weight=0.5)
+    contrastive_criterion = NTXentLoss(temperature=args.temperature)
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5, verbose=True)
+    print(f"Contrastive weight λ={args.contrastive_weight}  temperature τ={args.temperature}")
 
     best_val_iou = 0.0
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -198,8 +269,9 @@ def train(args):
         epoch_start = time.time()
         print(f"Epoch {epoch}/{args.epochs}")
 
-        train_loss, train_iou, train_dice = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+        train_loss, train_seg, train_contra, train_iou, train_dice = train_one_epoch(
+            model, train_loader, criterion, contrastive_criterion,
+            args.contrastive_weight, optimizer, device,
         )
         val_loss, val_iou, val_dice = validate(
             model, val_loader, criterion, device
@@ -208,13 +280,14 @@ def train(args):
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
 
-        epoch_duration = time.time() - epoch_start
-        elapsed        = time.time() - training_start
+        epoch_duration   = time.time() - epoch_start
+        elapsed          = time.time() - training_start
         remaining_epochs = args.epochs - epoch
-        eta_s          = (elapsed / epoch) * remaining_epochs
-        eta_str        = f"{int(eta_s // 60)}m {int(eta_s % 60):02d}s"
+        eta_s            = (elapsed / epoch) * remaining_epochs
+        eta_str          = f"{int(eta_s // 60)}m {int(eta_s % 60):02d}s"
 
-        print(f"  Train — Loss: {train_loss:.4f} | IoU: {train_iou:.4f} | Dice: {train_dice:.4f}")
+        print(f"  Train — Loss: {train_loss:.4f} | Seg: {train_seg:.4f} | "
+              f"Contra: {train_contra:.4f} | IoU: {train_iou:.4f} | Dice: {train_dice:.4f}")
         print(f"  Val   — Loss: {val_loss:.4f} | IoU: {val_iou:.4f} | Dice: {val_dice:.4f}")
         print(f"  LR: {current_lr:.6f}")
         print(f"  Time: {epoch_duration:.1f}s | Elapsed: {elapsed/60:.1f}m | ETA: {eta_str}")
@@ -234,18 +307,20 @@ def train(args):
             print(f"  ** New best model saved (IoU: {val_iou:.4f}) **")
 
         epoch_logs.append({
-            "epoch":            epoch,
-            "timestamp":        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "epoch_duration_s": round(epoch_duration, 2),
-            "elapsed_s":        round(elapsed, 2),
-            "train_loss":       round(train_loss, 6),
-            "train_iou":        round(train_iou, 6),
-            "train_dice":       round(train_dice, 6),
-            "val_loss":         round(val_loss, 6),
-            "val_iou":          round(val_iou, 6),
-            "val_dice":         round(val_dice, 6),
-            "lr":               current_lr,
-            "is_best":          is_best,
+            "epoch":             epoch,
+            "timestamp":         datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "epoch_duration_s":  round(epoch_duration, 2),
+            "elapsed_s":         round(elapsed, 2),
+            "train_loss":        round(train_loss, 6),
+            "train_seg_loss":    round(train_seg, 6),
+            "train_contra_loss": round(train_contra, 6),
+            "train_iou":         round(train_iou, 6),
+            "train_dice":        round(train_dice, 6),
+            "val_loss":          round(val_loss, 6),
+            "val_iou":           round(val_iou, 6),
+            "val_dice":          round(val_dice, 6),
+            "lr":                current_lr,
+            "is_best":           is_best,
         })
         with open(log_path, "w") as f:
             json.dump(epoch_logs, f, indent=2)
@@ -284,7 +359,11 @@ if __name__ == "__main__":
     parser.add_argument("--epochs",         type=int,   default=25)
     parser.add_argument("--batch-size",     type=int,   default=32)
     parser.add_argument("--lr",             type=float, default=1e-3)
-    parser.add_argument("--ndvi-threshold", type=float, default=0.3)
-    parser.add_argument("--num-workers",    type=int,   default=0)
+    parser.add_argument("--ndvi-threshold",    type=float, default=0.3)
+    parser.add_argument("--num-workers",       type=int,   default=0)
+    parser.add_argument("--contrastive-weight", type=float, default=0.1,
+                        help="λ: weight of NT-Xent contrastive loss (0 = disabled)")
+    parser.add_argument("--temperature",        type=float, default=0.07,
+                        help="τ: NT-Xent softmax temperature (lower = sharper)")
     args = parser.parse_args()
     train(args)

@@ -17,8 +17,6 @@ Two architectures are provided:
       The 6 input channels are processed jointly from the first conv layer,
       so spectral + topographic cues are fused at every spatial scale.
 
-ElevationPOIUNet is kept as an alias for ElevationPOITransUNet so that
-existing train.py / predict.py imports require no changes.
 """
 
 import torch
@@ -333,23 +331,41 @@ class ElevationPOITransUNet(nn.Module):
         self.dec1 = DecoderBlock(128, 64)
         self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_embedding: bool = False):
+        """Forward pass.
+
+        Args:
+            x:                Input tensor (B, 6, H, W) — RGB + DEM + Slope + Aspect.
+            return_embedding: When True, also return the L2-normalised (B, 512)
+                              bottleneck embedding computed at no extra cost.
+                              Use this during training to avoid calling encode()
+                              separately (halves encoder compute vs. two passes).
+
+        Returns:
+            prediction              when return_embedding=False  (default)
+            (prediction, embedding) when return_embedding=True
+        """
         # CNN Encoder — save skip connections at each scale
-        skip1 = self.enc1(x)                    # (B,  64, 64, 64)
-        skip2 = self.enc2(self.pool(skip1))      # (B, 128, 32, 32)
-        skip3 = self.enc3(self.pool(skip2))      # (B, 256, 16, 16)
-        x     = self.enc4(self.pool(skip3))      # (B, 512,  8,  8)
+        skip1      = self.enc1(x)                    # (B,  64, 64, 64)
+        skip2      = self.enc2(self.pool(skip1))      # (B, 128, 32, 32)
+        skip3      = self.enc3(self.pool(skip2))      # (B, 256, 16, 16)
+        bottleneck = self.enc4(self.pool(skip3))      # (B, 512,  8,  8)
 
         # Transformer Bottleneck — global context over 8x8=64 spatial tokens
-        x = self.transformer(x)                  # (B, 512,  8,  8)
+        bottleneck = self.transformer(bottleneck)     # (B, 512,  8,  8)
 
         # CNN Decoder — recover full resolution via skip connections
-        x = self.dec3(x, skip3)                  # (B, 256, 16, 16)
-        x = self.dec2(x, skip2)                  # (B, 128, 32, 32)
-        x = self.dec1(x, skip1)                  # (B,  64, 64, 64)
+        out = self.dec3(bottleneck, skip3)            # (B, 256, 16, 16)
+        out = self.dec2(out, skip2)                   # (B, 128, 32, 32)
+        out = self.dec1(out, skip1)                   # (B,  64, 64, 64)
+        prediction = torch.sigmoid(self.final_conv(out))  # (B, 1, 64, 64)
 
-        x = self.final_conv(x)                   # (B,   1, 64, 64)
-        return torch.sigmoid(x)
+        if return_embedding:
+            emb = bottleneck.mean(dim=[2, 3])                        # (B, 512)
+            emb = nn.functional.normalize(emb, p=2, dim=1)          # L2-norm
+            return prediction, emb
+
+        return prediction
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Extract a fixed-size image embedding from the Transformer bottleneck.
