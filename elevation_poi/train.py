@@ -7,6 +7,7 @@ embedding index from the trained model's Transformer bottleneck representations.
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -18,8 +19,11 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
+# Shared dataset module lives at the project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from dataset import get_elevation_dataloaders as get_dataloaders  # noqa: E402
+
 from model import ElevationPOITransUNet, count_parameters
-from dataset import get_dataloaders
 
 
 def compute_iou(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.3) -> float:

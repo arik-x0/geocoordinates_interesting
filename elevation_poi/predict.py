@@ -7,14 +7,18 @@ heatmap visualizations.
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
+# Shared dataset module lives at the project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from dataset import get_elevation_dataloaders as get_dataloaders  # noqa: E402
+
 from model import ElevationPOITransUNet
-from dataset import get_dataloaders
 from utils import (
     compute_poi_score,
     visualize_poi,

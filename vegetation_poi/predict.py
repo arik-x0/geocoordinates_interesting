@@ -7,14 +7,18 @@ images, and saves visualizations.
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
+# Shared dataset module lives at the project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from dataset import get_vegetation_dataloaders as get_dataloaders  # noqa: E402
+
 from model import TransUNet
-from dataset import get_dataloaders
 from utils import (
     greenery_score_from_prediction,
     visualize_prediction,
