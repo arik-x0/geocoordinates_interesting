@@ -22,22 +22,11 @@ import torch
 from pathlib import Path
 from scipy.ndimage import sobel, binary_closing, binary_dilation
 
-
-# ── Sentinel-2 band indices (0-based, 13-band EuroSAT .tif) ─────────────────
-BAND_RED   = 3   # Band 4  — 665 nm
-BAND_GREEN = 2   # Band 3  — 560 nm
-BAND_BLUE  = 1   # Band 2  — 490 nm
-BAND_NIR   = 7   # Band 8  — 842 nm  (used in NDBI)
-BAND_SWIR  = 10  # Band 11 — 1610 nm (used in NDBI)
-
-# ── Housing density thresholds ───────────────────────────────────────────────
-HOUSING_DENSITY_MIN = 0.05   # at least 5% built-up coverage
-HOUSING_DENSITY_MAX = 0.20   # at most 20% built-up coverage (not overly urban)
-
-# ── Label generation parameters ─────────────────────────────────────────────
-NDBI_THRESHOLD   = 0.0   # NDBI > 0 → built-up surface
-GRADIENT_WEIGHT  = 0.4   # how much gradient magnitude contributes to the label
-CLOSING_SIZE     = 3     # morphological closing kernel size (fills gaps in outlines)
+from constants import (
+    BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR, BAND_SWIR,
+    HOUSING_DENSITY_MIN, HOUSING_DENSITY_MAX,
+    NDBI_THRESHOLD, GRADIENT_WEIGHT, CLOSING_SIZE,
+)
 
 
 def compute_ndbi(nir: np.ndarray, swir: np.ndarray) -> np.ndarray:

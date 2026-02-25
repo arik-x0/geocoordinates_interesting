@@ -141,7 +141,7 @@ Each `predict.py` saves to an `output/` directory:
 - Per-image visualizations ranked by POI score (top-N and bottom-5)
 - A ranking overview grid image
 - Console tables with per-class POI statistics
-- (Vegetation & Elevation) VectorDB similarity search results for the top-5 predictions
+- VectorDB similarity search results for the top predictions (all three models)
 
 Checkpoints saved by `train.py`:
 
@@ -150,7 +150,7 @@ Checkpoints saved by `train.py`:
 | `best_model.pth` | Model + optimizer state at best validation IoU |
 | `final_model.pth` | Model + optimizer state after last epoch |
 | `training_log.json` | Per-epoch metrics, timing, and `is_best` flag |
-| `embedding_index.faiss` | FAISS index built from best model (veg/elev only) |
+| `embedding_index.faiss` | FAISS index built from best model (all three models) |
 | `embedding_meta.json` | Per-vector metadata aligned with FAISS index |
 
 ---
@@ -181,24 +181,24 @@ pip install -r requirements.txt
 
 ### Critical
 
-- [ ] **Centralise band indices** — `BAND_RED`, `BAND_NIR`, etc. are declared identically in all three `utils.py` files and again in `dataset.py`. Extract into a single `constants.py` to eliminate the risk of silent divergence across four locations.
+- [x] **Centralise band indices** — `BAND_RED`, `BAND_NIR`, etc. are declared identically in all three `utils.py` files and again in `dataset.py`. Extract into a single `constants.py` to eliminate the risk of silent divergence across four locations.
 
-- [ ] **Improve contrastive positives** — NT-Xent currently uses EuroSAT class names as positive pairs. This is semantically weak: the `"Industrial"` class contains highways, mines, and factories. Replace with augmentation-based pairs (two augmented views of the same tile) or learned similarity, rather than coarse class labels.
+- [x] **Improve contrastive positives** — NT-Xent currently uses EuroSAT class names as positive pairs. This is semantically weak: the `"Industrial"` class contains highways, mines, and factories. Replace with augmentation-based pairs (two augmented views of the same tile) or learned similarity, rather than coarse class labels.
 
-- [ ] **Add `encode()` and VectorDB to the Housing model** — The housing pipeline has no embedding extraction, making cross-model or intra-model similarity search impossible. Implement `encode()` on `HousingEdgeCNN` and build a FAISS index post-training, consistent with the other two models.
+- [x] **Add `encode()` and VectorDB to the Housing model** — The housing pipeline has no embedding extraction, making cross-model or intra-model similarity search impossible. Implement `encode()` on `HousingEdgeCNN` and build a FAISS index post-training, consistent with the other two models.
 
 ### Moderate
 
-- [ ] **Log and track synthetic DEM fallback** — When SRTM download fails, `generate_synthetic_dem()` is used silently. Add a warning and record the DEM source (`"real"` / `"synthetic"`) in the per-sample metadata and training log so embedding quality degradation can be traced.
+- [x] **Log and track synthetic DEM fallback** — When SRTM download fails, `generate_synthetic_dem()` is used silently. Add a warning and record the DEM source (`"real"` / `"synthetic"`) in the per-sample metadata and training log so embedding quality degradation can be traced.
 
-- [ ] **Extract shared training boilerplate** — `train_one_epoch()`, `validate()`, `compute_iou()`, and `compute_dice()` are largely copy-pasted across all three `train.py` files. Move into a shared `training_utils.py` to reduce maintenance surface.
+- [x] **Extract shared training boilerplate** — `train_one_epoch()`, `validate()`, `compute_iou()`, and `compute_dice()` are largely copy-pasted across all three `train.py` files. Move into a shared `training_utils.py` to reduce maintenance surface.
 
-- [ ] **Handle all-zero channel normalisation** — `normalize_channel()` returns an all-zeros array when a tile has zero variance (e.g. a fully flat DEM tile). This corrupts the 6-channel input silently. Add a warning and a fallback (e.g. return the raw channel or a small noise floor).
+- [x] **Handle all-zero channel normalisation** — `normalize_channel()` returns an all-zeros array when a tile has zero variance (e.g. a fully flat DEM tile). This corrupts the 6-channel input silently. Add a warning and a fallback (e.g. return the raw channel or a small noise floor).
 
 ### Minor
 
-- [ ] **Centralise magic-number thresholds** — `compute_poi_score()` hardcodes the top-10% pixel cutoff; housing density thresholds (5%–20%) are scattered across `utils.py`. Move to named constants or expose as CLI arguments.
+- [x] **Centralise magic-number thresholds** — `compute_poi_score()` hardcodes the top-10% pixel cutoff; housing density thresholds (5%–20%) are scattered across `utils.py`. Move to named constants or expose as CLI arguments.
 
-- [ ] **Remove unused dependencies** — `torchvision` and `scikit-learn` are listed in `requirements.txt` but not used anywhere in the codebase.
+- [x] **Remove unused dependencies** — `torchvision` and `scikit-learn` are listed in `requirements.txt` but not used anywhere in the codebase.
 
-- [ ] **Tune NT-Xent temperature** — τ=0.07 is the ViT paper default and has not been ablated for satellite imagery. Consider adding a short sweep over τ ∈ {0.05, 0.07, 0.1, 0.2} to confirm the default is appropriate.
+- [x] **Tune NT-Xent temperature** — τ=0.07 is the ViT paper default and has not been ablated for satellite imagery. Consider adding a short sweep over τ ∈ {0.05, 0.07, 0.1, 0.2} to confirm the default is appropriate.

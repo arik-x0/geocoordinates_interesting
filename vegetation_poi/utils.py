@@ -9,15 +9,10 @@ import matplotlib.colors as mcolors
 import torch
 from pathlib import Path
 
-
-# EuroSAT Sentinel-2 band indices (0-indexed in the 13-band .tif files)
-BAND_RED = 3    # Band 4 (Red) — 665 nm
-BAND_GREEN = 2  # Band 3 (Green) — 560 nm
-BAND_BLUE = 1   # Band 2 (Blue) — 490 nm
-BAND_NIR = 7    # Band 8 (NIR) — 842 nm
-
-# NDVI threshold: pixels above this are considered greenery
-NDVI_GREENERY_THRESHOLD = 0.3
+from constants import (
+    BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR,
+    NDVI_GREENERY_THRESHOLD, GREENERY_THRESHOLD,
+)
 
 
 def compute_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
@@ -48,7 +43,7 @@ def compute_greenery_ratio(mask: np.ndarray) -> float:
     return float(mask.sum()) / mask.size
 
 
-def greenery_score_from_prediction(prediction: torch.Tensor, threshold: float = 0.5) -> float:
+def greenery_score_from_prediction(prediction: torch.Tensor, threshold: float = GREENERY_THRESHOLD) -> float:
     """Compute greenery ratio from a model's sigmoid output tensor."""
     binary = (prediction > threshold).float()
     return float(binary.sum().item()) / binary.numel()

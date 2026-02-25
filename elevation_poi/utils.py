@@ -11,21 +11,18 @@ import math
 from pathlib import Path
 from typing import Tuple, Optional
 
+import warnings
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 
-# ─── Sentinel-2 Band Indices (0-indexed in 13-band EuroSAT .tif) ────────────
-BAND_RED = 3     # Band 4 — 665 nm
-BAND_GREEN = 2   # Band 3 — 560 nm
-BAND_BLUE = 1    # Band 2 — 490 nm
-BAND_NIR = 7     # Band 8 — 842 nm
-
-# ─── Thresholds ──────────────────────────────────────────────────────────────
-NDWI_WATER_THRESHOLD = 0.3       # NDWI above this = water pixel
-CLIFF_SLOPE_THRESHOLD = 15.0     # Slope above this (degrees) = cliff candidate
-POI_PROXIMITY_SIGMA = 5.0        # Gaussian decay sigma for water proximity (pixels)
+from constants import (
+    BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR,
+    NDWI_WATER_THRESHOLD, CLIFF_SLOPE_THRESHOLD, POI_PROXIMITY_SIGMA,
+    POI_TOP_PERCENTILE,
+)
 
 # ─── SRTM Configuration ─────────────────────────────────────────────────────
 SRTM_BASE_URL = "https://srtm.csi.cgiar.org/wp-content/uploads/files/srtm_5x5/TIFF"
@@ -335,7 +332,7 @@ def compute_poi_score(heatmap: np.ndarray) -> float:
     flat = heatmap.flatten()
     if len(flat) == 0:
         return 0.0
-    top_k = max(1, int(len(flat) * 0.10))
+    top_k = max(1, int(len(flat) * POI_TOP_PERCENTILE))
     top_values = np.partition(flat, -top_k)[-top_k:]
     return float(top_values.mean())
 
@@ -350,7 +347,13 @@ def normalize_channel(arr: np.ndarray) -> np.ndarray:
     vmin, vmax = np.nanmin(arr), np.nanmax(arr)
     if vmax > vmin:
         return (arr - vmin) / (vmax - vmin)
-    return np.zeros_like(arr)
+    warnings.warn(
+        f"normalize_channel: zero-variance input (all values={vmin:.4f}), "
+        f"returning zeros (shape={arr.shape}). "
+        "This may indicate a flat DEM tile or missing data.",
+        stacklevel=2,
+    )
+    return np.zeros_like(arr, dtype=np.float32)
 
 
 def normalize_rgb(bands: np.ndarray) -> np.ndarray:

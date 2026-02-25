@@ -17,6 +17,7 @@ each model's utils.py stays in its own directory without polluting sys.path.
 
 import importlib.util
 import os
+import sys
 import zipfile
 import urllib.request
 from pathlib import Path
@@ -31,6 +32,17 @@ from torch.utils.data import Dataset, DataLoader, random_split
 
 # ── Project root ──────────────────────────────────────────────────────────────
 _ROOT = Path(__file__).parent
+
+# Ensure the project root is on sys.path so sub-utils can import constants
+_ROOT_STR = str(_ROOT)
+if _ROOT_STR not in sys.path:
+    sys.path.insert(0, _ROOT_STR)
+
+from constants import (  # noqa: E402
+    BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR,
+    NDVI_GREENERY_THRESHOLD, NDWI_WATER_THRESHOLD,
+    CLIFF_SLOPE_THRESHOLD, POI_PROXIMITY_SIGMA,
+)
 
 
 # ── Utility loader ────────────────────────────────────────────────────────────
@@ -48,17 +60,10 @@ _veg_utils   = _load_subutils("vegetation_poi")
 _elev_utils  = _load_subutils("elevation_poi")
 _house_utils = _load_subutils("housing_poi")
 
-# ── Shared band indices (identical in all three utils) ────────────────────────
-BAND_RED   = _elev_utils.BAND_RED    # Band 4 — 665 nm
-BAND_GREEN = _elev_utils.BAND_GREEN  # Band 3 — 560 nm
-BAND_BLUE  = _elev_utils.BAND_BLUE   # Band 2 — 490 nm
-BAND_NIR   = _elev_utils.BAND_NIR    # Band 8 — 842 nm
-
 # ── Vegetation helpers ────────────────────────────────────────────────────────
 extract_rgb             = _elev_utils.extract_rgb
 compute_ndvi            = _veg_utils.compute_ndvi
 ndvi_to_mask            = _veg_utils.ndvi_to_mask
-NDVI_GREENERY_THRESHOLD = _veg_utils.NDVI_GREENERY_THRESHOLD
 
 # ── Elevation helpers ─────────────────────────────────────────────────────────
 normalize_channel      = _elev_utils.normalize_channel
@@ -70,9 +75,6 @@ download_srtm_tile     = _elev_utils.download_srtm_tile
 read_srtm_hgt          = _elev_utils.read_srtm_hgt
 extract_dem_for_bounds = _elev_utils.extract_dem_for_bounds
 get_srtm_tile_id       = _elev_utils.get_srtm_tile_id
-CLIFF_SLOPE_THRESHOLD  = _elev_utils.CLIFF_SLOPE_THRESHOLD
-POI_PROXIMITY_SIGMA    = _elev_utils.POI_PROXIMITY_SIGMA
-NDWI_WATER_THRESHOLD   = _elev_utils.NDWI_WATER_THRESHOLD
 
 # ── Housing helpers ───────────────────────────────────────────────────────────
 generate_structure_label = _house_utils.generate_structure_label
@@ -289,14 +291,22 @@ class ElevationPOIDataset(Dataset):
         h, w = all_bands.shape[1], all_bands.shape[2]
         rgb  = extract_rgb(all_bands)  # (3, 64, 64)
 
+        import warnings
         dem = None
+        dem_source = "synthetic"
         if self.use_real_dem:
             try:
                 dem = get_dem_for_tile(str(filepath), self.srtm_cache)
             except Exception:
                 dem = None
         if dem is None:
+            warnings.warn(
+                f"DEM unavailable for tile, using synthetic fallback: {filepath}",
+                stacklevel=2,
+            )
             dem = generate_synthetic_dem((h, w), seed=idx)
+        else:
+            dem_source = "real"
 
         slope, aspect = compute_slope_aspect(dem)
 
@@ -338,6 +348,7 @@ class ElevationPOIDataset(Dataset):
             "has_cliffs":     has_cliffs,
             "water_fraction": float(water_mask.mean()),
             "max_slope":      float(slope.max()),
+            "dem_source":     dem_source,
         }
         return input_tensor, target_tensor, meta
 

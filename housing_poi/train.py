@@ -17,59 +17,14 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-# Shared dataset module lives at the project root
+# Shared modules live at the project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from dataset import get_housing_dataloaders as get_dataloaders  # noqa: E402
+from training_utils import (  # noqa: E402
+    compute_iou, compute_dice, DiceBCELoss, build_embedding_index,
+)
 
 from model import HousingEdgeCNN, count_parameters
-
-
-def compute_iou(pred: torch.Tensor, target: torch.Tensor,
-                threshold: float = 0.5) -> float:
-    """IoU for binary structure masks."""
-    pred_binary   = (pred > threshold).float()
-    target_binary = (target > threshold).float()
-    intersection  = (pred_binary * target_binary).sum()
-    union = pred_binary.sum() + target_binary.sum() - intersection
-    if union == 0:
-        return 1.0
-    return float(intersection / union)
-
-
-def compute_dice(pred: torch.Tensor, target: torch.Tensor,
-                 threshold: float = 0.5) -> float:
-    """Dice coefficient for binary structure masks."""
-    pred_binary   = (pred > threshold).float()
-    target_binary = (target > threshold).float()
-    intersection  = (pred_binary * target_binary).sum()
-    total = pred_binary.sum() + target_binary.sum()
-    if total == 0:
-        return 1.0
-    return float(2.0 * intersection / total)
-
-
-class DiceBCELoss(nn.Module):
-    """Combined Dice + Binary Cross-Entropy loss.
-
-    BCE handles class imbalance well (most satellite pixels are non-structure).
-    Dice ensures the spatial extent of predicted structures matches the label.
-    """
-
-    def __init__(self, dice_weight: float = 0.5):
-        super().__init__()
-        self.bce = nn.BCELoss()
-        self.dice_weight = dice_weight
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        bce_loss = self.bce(pred, target)
-
-        smooth = 1e-6
-        intersection = (pred * target).sum()
-        dice_loss = 1.0 - (2.0 * intersection + smooth) / (
-            pred.sum() + target.sum() + smooth
-        )
-
-        return (1 - self.dice_weight) * bce_loss + self.dice_weight * dice_loss
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -126,7 +81,7 @@ def train(args):
     print(f"Using device: {device}")
 
     print("\n--- Loading Dataset ---")
-    train_loader, val_loader, _ = get_dataloaders(
+    train_loader, val_loader, test_loader = get_dataloaders(
         data_dir=Path(args.data_dir),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -224,6 +179,14 @@ def train(args):
     }, final_path)
 
     print(f"Models saved to: {checkpoint_dir}")
+
+    # Build VectorDB from the best model's stage-4 bottleneck embeddings
+    best_ckpt = torch.load(checkpoint_dir / "best_model.pth",
+                           map_location=device, weights_only=True)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+    build_embedding_index(
+        model, [train_loader, val_loader, test_loader], device, checkpoint_dir
+    )
 
 
 if __name__ == "__main__":

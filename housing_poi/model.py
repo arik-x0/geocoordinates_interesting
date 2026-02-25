@@ -105,6 +105,9 @@ class HousingEdgeCNN(nn.Module):
         # Learnable fusion of all four side outputs
         self.fusion = nn.Conv2d(4, out_channels, kernel_size=1)
 
+        # Linear projection for VectorDB embeddings: 256 → 512 (matches other models)
+        self.embed_proj = nn.Linear(256, 512)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Multi-scale encoder
         f1 = self.stage1(x)    # (B,  32, 64, 64)
@@ -122,6 +125,24 @@ class HousingEdgeCNN(nn.Module):
         fused = torch.cat([s1, s2, s3, s4], dim=1)   # (B, 4, 64, 64)
         out = self.fusion(fused)                       # (B, 1, 64, 64)
         return torch.sigmoid(out)
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract a 512-dim L2-normalised embedding from the stage-4 bottleneck.
+
+        Mean-pools the (B, 256, 16, 16) stage-4 feature map to (B, 256), then
+        projects to 512-dim for consistency with the TransUNet-based models.
+        The resulting vectors are L2-normalised and directly usable with a
+        FAISS IndexFlatIP index (inner product = cosine similarity).
+
+        Call within torch.no_grad() during indexing and retrieval.
+        """
+        f1 = self.stage1(x)
+        f2 = self.stage2(f1)
+        f3 = self.stage3(f2)
+        f4 = self.stage4(f3)              # (B, 256, 16, 16)
+        emb = f4.mean(dim=[2, 3])         # (B, 256) spatial mean-pool
+        emb = self.embed_proj(emb)        # (B, 512) projected
+        return F.normalize(emb, p=2, dim=1)  # L2-normalise
 
 
 def count_parameters(model: nn.Module) -> int:

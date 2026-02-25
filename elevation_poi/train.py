@@ -12,40 +12,21 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
-# Shared dataset module lives at the project root
+# Shared modules live at the project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from dataset import get_elevation_dataloaders as get_dataloaders  # noqa: E402
+from training_utils import (  # noqa: E402
+    compute_iou, compute_dice, NTXentLoss,
+    augment_batch, build_embedding_index,
+)
 
 from model import ElevationPOITransUNet, count_parameters
-
-
-def compute_iou(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.3) -> float:
-    """IoU for continuous heatmaps (thresholded to binary)."""
-    pred_binary   = (pred > threshold).float()
-    target_binary = (target > threshold).float()
-    intersection  = (pred_binary * target_binary).sum()
-    union = pred_binary.sum() + target_binary.sum() - intersection
-    if union == 0:
-        return 1.0
-    return float(intersection / union)
-
-
-def compute_dice(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.3) -> float:
-    """Dice coefficient for continuous heatmaps."""
-    pred_binary   = (pred > threshold).float()
-    target_binary = (target > threshold).float()
-    intersection  = (pred_binary * target_binary).sum()
-    total = pred_binary.sum() + target_binary.sum()
-    if total == 0:
-        return 1.0
-    return float(2.0 * intersection / total)
 
 
 class HeatmapLoss(nn.Module):
@@ -65,60 +46,6 @@ class HeatmapLoss(nn.Module):
         return self.mse_weight * mse_loss + self.dice_weight * dice_loss
 
 
-class NTXentLoss(nn.Module):
-    """NT-Xent (InfoNCE) contrastive loss over a batch of L2-normalised embeddings.
-
-    Positive pairs: images sharing the same EuroSAT class name in the batch.
-    Negative pairs: all other images in the batch.
-
-    Because model.encode() already returns L2-normalised vectors, inner product
-    equals cosine similarity, so no extra normalisation is needed here.
-
-    Loss for anchor i:
-        -1/|P_i| * Σ_{p∈P_i} [ sim(i,p)/τ  −  log Σ_{j≠i} exp(sim(i,j)/τ) ]
-
-    When there are no positive pairs for an anchor (its class appears only once
-    in the batch) that anchor is skipped — its loss contribution is zero.
-    """
-
-    def __init__(self, temperature: float = 0.07):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, embeddings: torch.Tensor, class_names: list) -> torch.Tensor:
-        B      = embeddings.size(0)
-        device = embeddings.device
-
-        # Cosine similarity matrix (B, B) — embeddings are L2-normalised
-        sim = torch.mm(embeddings, embeddings.T) / self.temperature
-
-        # Build positive mask: True where i and j share the same class
-        unique_classes = list(set(class_names))
-        class_to_idx   = {c: i for i, c in enumerate(unique_classes)}
-        label_ids = torch.tensor(
-            [class_to_idx[c] for c in class_names], dtype=torch.long, device=device
-        )
-        pos_mask = (label_ids.unsqueeze(0) == label_ids.unsqueeze(1))  # (B, B)
-        pos_mask.fill_diagonal_(False)
-
-        if not pos_mask.any():
-            return embeddings.sum() * 0.0   # differentiable zero
-
-        # Denominator: log Σ_{j≠i} exp(sim(i,j)/τ)  — exclude self
-        self_mask = torch.eye(B, dtype=torch.bool, device=device)
-        log_denom = torch.logsumexp(sim.masked_fill(self_mask, float("-inf")), dim=1)
-
-        losses = []
-        for i in range(B):
-            pos_idx = pos_mask[i].nonzero(as_tuple=True)[0]
-            if len(pos_idx) == 0:
-                continue
-            loss_i = -(sim[i, pos_idx] - log_denom[i]).mean()
-            losses.append(loss_i)
-
-        return torch.stack(losses).mean()
-
-
 def train_one_epoch(model, loader, criterion, contrastive_criterion,
                     contrastive_weight, optimizer, device):
     """Train for one epoch.
@@ -131,18 +58,20 @@ def train_one_epoch(model, loader, criterion, contrastive_criterion,
     n_batches = 0
 
     pbar = tqdm(loader, desc="  Train", leave=False)
-    for inputs, targets, meta in pbar:
+    for inputs, targets, _meta in pbar:
         inputs  = inputs.to(device)
         targets = targets.to(device)
 
         optimizer.zero_grad()
-        # Single forward pass — encoder runs once, embedding comes for free
-        predictions, embeddings = model(inputs, return_embedding=True)
-        seg_loss    = criterion(predictions, targets)
+        # Single forward pass — encoder runs once, embedding (view 1) comes for free
+        predictions, emb1 = model(inputs, return_embedding=True)
+        seg_loss = criterion(predictions, targets)
 
-        # Contrastive loss on the bottleneck embeddings (no extra encoder pass)
-        class_names = [m["class_name"] for m in meta]
-        contra_loss = contrastive_criterion(embeddings, class_names)
+        # SimCLR-style contrastive: second view is a spatially augmented copy
+        # All 6 channels (RGB + DEM + slope + aspect) are flipped/rotated together
+        inputs_aug = augment_batch(inputs)
+        emb2 = model.encode(inputs_aug)
+        contra_loss = contrastive_criterion(emb1, emb2)
 
         loss = seg_loss + contrastive_weight * contra_loss
         loss.backward()
@@ -178,65 +107,6 @@ def validate(model, loader, criterion, device):
         n_batches  += 1
 
     return total_loss / n_batches, total_iou / n_batches, total_dice / n_batches
-
-
-@torch.no_grad()
-def build_embedding_index(model, loaders, device, checkpoint_dir: Path):
-    """Extract Transformer bottleneck embeddings and build a FAISS VectorDB index.
-
-    Iterates all three data splits (train / val / test), calls model.encode()
-    to get L2-normalised 512-dim vectors from the 6-channel input (RGB + DEM
-    + Slope + Aspect), and builds a FAISS IndexFlatIP index.
-    Similarity search therefore reflects both spectral and topographic likeness.
-
-    Saved files:
-        <checkpoint_dir>/embedding_index.faiss  — FAISS index (exact cosine sim)
-        <checkpoint_dir>/embedding_meta.json    — per-vector metadata list
-    """
-    try:
-        import faiss
-    except ImportError:
-        print("WARNING: faiss-cpu not installed — skipping VectorDB index build.")
-        print("         Install with: pip install faiss-cpu")
-        return
-
-    model.eval()
-    all_embeddings = []
-    all_meta = []
-
-    print("\n--- Building VectorDB Embedding Index ---")
-    for split_name, loader in zip(["train", "val", "test"], loaders):
-        for inputs, _targets, metas in tqdm(loader, desc=f"  Encoding {split_name}"):
-            inputs = inputs.to(device)
-            emb = model.encode(inputs).cpu().numpy()   # (B, 512) L2-normalised
-            for i in range(len(emb)):
-                all_embeddings.append(emb[i])
-                all_meta.append({
-                    "split":          split_name,
-                    "filepath":       metas[i]["filepath"],
-                    "class_name":     metas[i]["class_name"],
-                    "has_water":      bool(metas[i]["has_water"]),
-                    "has_cliffs":     bool(metas[i]["has_cliffs"]),
-                    "water_fraction": float(metas[i]["water_fraction"]),
-                    "max_slope":      float(metas[i]["max_slope"]),
-                })
-
-    matrix = np.stack(all_embeddings).astype(np.float32)
-    dim = matrix.shape[1]   # 512
-
-    # IndexFlatIP on L2-normalised vectors = exact cosine similarity search
-    index = faiss.IndexFlatIP(dim)
-    index.add(matrix)
-
-    index_path = checkpoint_dir / "embedding_index.faiss"
-    meta_path  = checkpoint_dir / "embedding_meta.json"
-    faiss.write_index(index, str(index_path))
-    with open(meta_path, "w") as f:
-        json.dump(all_meta, f, indent=2)
-
-    print(f"  Indexed {index.ntotal} vectors (dim={dim})")
-    print(f"  Index:    {index_path}")
-    print(f"  Metadata: {meta_path}")
 
 
 def train(args):
