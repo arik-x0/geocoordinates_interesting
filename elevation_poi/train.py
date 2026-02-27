@@ -130,7 +130,7 @@ def train(args):
     criterion             = HeatmapLoss(mse_weight=0.5, dice_weight=0.5)
     contrastive_criterion = NTXentLoss(temperature=args.temperature)
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5)
     print(f"Contrastive weight λ={args.contrastive_weight}  temperature τ={args.temperature}")
 
     best_val_iou = 0.0
