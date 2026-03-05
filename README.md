@@ -8,23 +8,25 @@ Satellite imagery analysis project with three independent ML pipelines, each det
 
 ```
 geo_interesting/
-├── pretrained_model.py     ← EVA-02 ViT-UNet base class (shared by all 3 models)
+├── core/
+│   ├── __init__.py
+│   └── model.py            ← CoreSatelliteModel (EVA-02 ViT-S/14, frozen)
 ├── constants.py            ← band indices, thresholds, scoring constants
 ├── training_utils.py       ← shared loss functions, metrics, augmentation
 ├── dataset.py              ← shared dataset module (all 3 models)
 ├── requirements.txt
 ├── vegetation_poi/         ← NDVI greenery segmentation
-│   ├── model.py
+│   ├── model.py            ← TransUNet submodel (trained from scratch)
 │   ├── train.py
 │   ├── predict.py
 │   └── utils.py
 ├── elevation_poi/          ← cliff-near-water heatmap detection
-│   ├── model.py
+│   ├── model.py            ← ElevationPOITransUNet submodel (trained from scratch)
 │   ├── train.py
 │   ├── predict.py
 │   └── utils.py
 └── housing_poi/            ← low-density building edge detection
-    ├── model.py
+    ├── model.py            ← HousingEdgeCNN submodel (trained from scratch)
     ├── train.py
     ├── predict.py
     └── utils.py
@@ -34,39 +36,52 @@ geo_interesting/
 
 ## Model Architectures
 
-All three models share the same pretrained backbone defined in `pretrained_model.py`. Each task-specific `model.py` subclasses the base class and installs a custom output head.
+### Core — EVA-02 ViT-S/14 (`core/model.py`, frozen, MIT license)
 
-### Shared Backbone — EVA-02 ViT-UNet (~24M parameters, MIT license)
+Pretrained with masked image modelling on ImageNet-22K (BAAI). Loaded via `timm`.
+Provides multi-scale satellite image features to all three submodels.
 
 ```
-Input (B, C, 64, 64)
-  ↓  Channel adapter  Conv2d(C → 3)  [identity if C=3]
+Input (B, 3, 64, 64) RGB satellite tile
   ↓  Bilinear resize → 224×224
-  ↓  EVA-02 ViT-S/14  (pretrained, MIT)
-  │    patch_size=14 → 16×16 = 256 spatial tokens + 1 CLS
-  │    12 transformer blocks, embed_dim=384, 6 heads
-  │    Forward hooks tap blocks 2, 5, 8, 11 for skip features
-  ↓  U-Net Decoder
-  │    Block A  cat(block-11: 384, proj(block-8): 256) → ConvBlock → 256ch @ 16×16
-  │    Block B  upsample 16→32  + proj(block-5): 128ch  → ConvBlock → 128ch @ 32×32
-  │    Block C  upsample 32→64  + proj(block-2):  64ch  → ConvBlock →  64ch @ 64×64
-  ↓  Task-specific head  (see below)
-  ↓  (B, 1, 64, 64) — per-pixel POI probability heatmap [0, 1]
+  ↓  EVA-02 ViT-S/14  (12 blocks, embed_dim=384, 6 heads, patch_size=14)
+     Forward hooks capture block outputs at depths 2, 5, 8, 11
+     Each reshaped from (B, 257, 384) → (B, 384, 16, 16)
+
+  extract_features() returns dict:
+      blk2   (B, 384, 16×16)  — low-level visual features
+      blk5   (B, 384, 16×16)  — mid-level features
+      blk8   (B, 384, 16×16)  — deep features
+      blk11  (B, 384, 16×16)  — deepest semantic features
+      cls    (B, 384)          — global CLS descriptor
+
+  encode() → Linear(384→512) + L2-norm → (B, 512) FAISS embedding
 ```
 
-EVA-02 is pretrained with masked image modelling on ImageNet-22K (BAAI, MIT license). Loaded via `timm>=0.9.2`.
+The core runs under `torch.no_grad()` during all submodel training.
+Its weights are never updated.
 
-`encode()` runs only the backbone (skips the decoder) and returns a 512-dim L2-normalised CLS-token embedding for FAISS similarity search.
+### Submodels — all trained entirely from scratch
 
-### Task-Specific Output Heads
+Each submodel receives the core feature dict and adds its own trainable decoder + head.
 
-| Model | Head | Rationale |
-|---|---|---|
-| **Vegetation** (`TransUNet`) | SE channel-attention: AdaptiveAvgPool → Linear 64→16→64 → Sigmoid → re-weight 64ch → Conv2d(64→1) → Sigmoid | NDVI is spectral; SE re-weights decoder channels that track green-leaf signatures |
-| **Elevation** (`ElevationPOITransUNet`) | Soft activation `σ(x)·(1+0.1x)` + fixed 7×7 Gaussian blur (σ=1.5) | Cliff-water POIs are sparse, smooth heatmaps — soft activation avoids hard saturation; Gaussian enforces spatial coherence |
-| **Housing** (`HousingEdgeCNN`) | Depthwise Conv2d(64,64, 3×3) + BN + ReLU → Conv2d(64→1) → Sigmoid | Building boundaries are hard and rectangular; depthwise 3×3 learns per-channel Laplacian-like edge filters |
+| Model | Architecture | Task Head | Params |
+|---|---|---|---|
+| **Vegetation** `TransUNet` | 3-stage U-Net: proj(384→256/128/64) + bilinear 16→32→64 | SE channel-attention + Conv(64→1) + Sigmoid | ~2.5M |
+| **Housing** `HousingEdgeCNN` | 3-stage U-Net + side outputs at 16/32/64 | Depthwise edge conv + HED fusion | ~2.2M |
+| **Elevation** `ElevationPOITransUNet` | 2-stage RGB decoder + topo CNN (3→32→64ch) | Gaussian heatmap head | ~1.5M |
 
-The Elevation model takes **6 input channels** (RGB + DEM elevation + Slope + Aspect). A `Conv2d(6→3)` channel adapter fuses all topographic cues before the ViT so the full self-attention depth sees terrain information.
+#### Elevation dual-stream architecture
+
+```
+RGB stream (frozen core)               Topo stream (from scratch)
+blk11 (384ch, 16×16)                   DEM + Slope + Aspect (3ch, 64×64)
+  → proj+dec_a → 128ch @ 16×16           → topo_enc1 → 32ch @ 64×64
+  → dec_b+skip → 64ch  @ 32×32           → topo_enc2 → 64ch @ 64×64
+  → upsample   → 64ch  @ 64×64    ↘
+                                          cat → fusion(128→64) → heatmap head
+                                               → (B, 1, 64, 64)
+```
 
 ---
 
@@ -90,11 +105,11 @@ All three models share the same training loop structure: Adam optimizer, `Reduce
 
 | Model | Loss |
 |---|---|
-| Vegetation | DiceBCE + λ·NT-Xent (λ=0.1) |
-| Elevation | MSE+Dice + λ·NT-Xent (λ=0.1) |
+| Vegetation | DiceBCE |
+| Elevation | MSE+Dice |
 | Housing | DiceBCE only |
 
-**NT-Xent (SimCLR contrastive loss):** Two augmented views of the same tile are used as the positive pair. Augmentations are random horizontal/vertical flips and 90° rotations (applied in-batch with pure PyTorch, no torchvision required). This shapes the CLS-token embeddings to be invariant to spatial orientation while remaining discriminative across scene types. The `return_embedding=True` flag returns the prediction and embedding in a single forward pass, avoiding a redundant backbone run during training.
+Because the core is frozen during submodel training, contrastive loss is not applied — gradients cannot propagate to the embedding backbone. FAISS similarity search uses EVA-02 CLS-token embeddings directly, which are shaped by the backbone's masked image modelling pretraining.
 
 After training, vegetation and elevation build a **FAISS IndexFlatIP** over all splits. Inner product on L2-normalized vectors equals cosine similarity, enabling fast nearest-neighbour retrieval by visual and spectral/topographic similarity.
 
@@ -105,8 +120,6 @@ After training, vegetation and elevation build a **FAISS IndexFlatIP** over all 
 | `--epochs` | 25 | Number of training epochs |
 | `--batch-size` | 32 (veg) / 16 (elev, housing) | Batch size |
 | `--lr` | 1e-3 | Initial learning rate |
-| `--contrastive-weight` | 0.1 | λ: weight of NT-Xent loss (0 = disabled) |
-| `--temperature` | 0.07 | τ: NT-Xent softmax temperature |
 | `--ndvi-threshold` | 0.3 | Vegetation pseudo-label threshold |
 | `--cliff-threshold` | 15.0° | Slope angle for cliff classification |
 | `--water-threshold` | 0.3 | NDWI threshold for water detection |

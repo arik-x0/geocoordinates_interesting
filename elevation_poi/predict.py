@@ -17,6 +17,7 @@ from tqdm import tqdm
 # Shared dataset module lives at the project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from dataset import get_elevation_dataloaders as get_dataloaders  # noqa: E402
+from core.model import CoreSatelliteModel
 
 from model import ElevationPOITransUNet
 from utils import (
@@ -83,10 +84,10 @@ def query_similar(embedding: np.ndarray, index, meta: list, top_k: int = 5):
 # ── Inference ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def run_inference(model, test_loader, device, output_dir: Path, top_n: int = 20,
+def run_inference(core, submodel, test_loader, device, output_dir: Path, top_n: int = 20,
                   index=None, index_meta=None, top_k_similar: int = 5):
     """Run inference, rank by POI score, query VectorDB, and save visualizations."""
-    model.eval()
+    submodel.eval()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = []
@@ -94,8 +95,11 @@ def run_inference(model, test_loader, device, output_dir: Path, top_n: int = 20,
     print("Running inference on test set...")
     for input_batch, target_batch, meta_batch in tqdm(test_loader, desc="Inference"):
         input_batch = input_batch.to(device)
-        predictions = model(input_batch)      # (B, 1, 64, 64)
-        embeddings  = model.encode(input_batch)  # (B, 512) for VectorDB
+        rgb  = input_batch[:, :3]
+        topo = input_batch[:, 3:]
+        features    = core.extract_features(rgb)
+        predictions = submodel(features, topo)   # (B, 1, 64, 64)
+        embeddings  = core.encode(rgb)           # (B, 512) for VectorDB
 
         for i in range(input_batch.size(0)):
             input_np  = input_batch[i].cpu().numpy()         # (6, 64, 64)
@@ -265,7 +269,8 @@ def main(args):
     )
 
     run_inference(
-        model=model,
+        core=core,
+        submodel=submodel,
         test_loader=test_loader,
         device=device,
         output_dir=Path(args.output_dir),

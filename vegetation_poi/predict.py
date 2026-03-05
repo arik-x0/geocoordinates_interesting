@@ -17,6 +17,7 @@ from tqdm import tqdm
 # Shared dataset module lives at the project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from dataset import get_vegetation_dataloaders as get_dataloaders  # noqa: E402
+from core.model import CoreSatelliteModel
 
 from model import TransUNet
 from utils import (
@@ -82,7 +83,7 @@ def query_similar(embedding: np.ndarray, index, meta: list, top_k: int = 5):
 # ── Inference ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def run_inference(model, test_loader, device, output_dir: Path,
+def run_inference(core, submodel, test_loader, device, output_dir: Path,
                   top_n: int = 20, index=None, index_meta=None,
                   top_k_similar: int = 5):
     """Run inference, rank by greenery score, query VectorDB, save visualizations."""
@@ -94,8 +95,9 @@ def run_inference(model, test_loader, device, output_dir: Path,
     print("Running inference on test set...")
     for rgb_batch, mask_batch, meta_batch in tqdm(test_loader, desc="Inference"):
         rgb_batch = rgb_batch.to(device)
-        predictions = model(rgb_batch)              # (B, 1, 64, 64)
-        embeddings  = model.encode(rgb_batch)       # (B, 512) for VectorDB
+        features    = core.extract_features(rgb_batch)
+        predictions = submodel(features)            # (B, 1, 64, 64)
+        embeddings  = core.encode(rgb_batch)        # (B, 512) for VectorDB
 
         for i in range(rgb_batch.size(0)):
             rgb_np    = rgb_batch[i].cpu().numpy()          # (3, 64, 64)
@@ -225,7 +227,8 @@ def main(args):
     )
 
     run_inference(
-        model=model,
+        core=core,
+        submodel=submodel,
         test_loader=test_loader,
         device=device,
         output_dir=Path(args.output_dir),

@@ -1,120 +1,186 @@
 """
-Elevation POI model — EVA-02 ViT-UNet with Gaussian heatmap output head.
+Elevation POI submodel — RGB decoder + topographic encoder + Gaussian heatmap head.
+All layers trained from scratch.
 
 Task: predict cliff-near-water POI heatmaps from 6-channel satellite + DEM tiles.
-Ground truth: slope > threshold AND water proximity, convolved with a Gaussian
-to produce a smooth continuous heatmap rather than a hard binary mask.
+Ground truth: slope > threshold AND water proximity, convolved with a Gaussian kernel.
+Scored as mean activation in top-10% of heatmap pixels.
 
-Why a Gaussian heatmap head?
-Unlike housing or vegetation (binary masks), the elevation POI target is a
-sparse, continuous heatmap — most pixels are zero, and the signal appears as
-smooth peaks centred on cliff-water interface locations.  A standard sigmoid
-head (used for dense binary segmentation) has steep gradients near 0.5 and
-pushes predictions towards 0 or 1, which fights the smooth, continuous nature
-of the heatmap target and makes it difficult to learn intermediate confidence
-values at POI boundaries.
+This submodel uniquely fuses two information streams:
+  1. RGB stream  — from the frozen CoreSatelliteModel (ViT features of the satellite
+                   image), decoded from 16×16 → 64×64 via a lightweight U-Net decoder.
+  2. Topo stream — 3-channel input (DEM elevation + slope + aspect) processed by
+                   a small CNN encoder that learns topographic patterns from scratch.
 
-The Gaussian heatmap head addresses this with two changes:
-  1. The raw logit is passed through a *soft activation* that avoids
-     saturating at 0 for non-POI pixels:  act(x) = sigmoid(x) * (1 + 0.1*x)
-     This produces gentler gradients than plain sigmoid, allowing the model
-     to maintain a wide, smooth probability hill around POI peaks rather than
-     a hard step.
-  2. A fixed 7×7 Gaussian blur (σ=1.5) is applied to the activation output,
-     enforcing spatial coherence.  This mirrors the way the ground-truth
-     heatmap is generated (Gaussian-blurred cliff+water mask) so the model's
-     output space matches its training target.
+The streams are fused at 64×64 and passed through a Gaussian heatmap head that
+enforces smooth, spatially coherent output matching the Gaussian ground-truth labels.
 
-The channel adapter (Conv2d 6→3) fuses RGB + DEM elevation + slope + aspect
-before the ViT so all topographic cues are available to the self-attention
-mechanism throughout the full transformer depth.
+Input to forward():
+    features: dict from CoreSatelliteModel.extract_features()  (RGB features)
+              Key used: 'blk11' (B,384,16,16), 'blk5' (B,384,16,16)
+    topo:     (B, 3, 64, 64) — DEM elevation + slope + aspect channels
 
-Output metadata (populated by predict.py):
-    poi_score    — float [0, 1]: mean of top-10% highest heatmap values
-    dem_source   — str: "real" or "synthetic" (DEM availability flag)
-    slope_mean   — float: mean terrain slope for the tile (degrees)
-    ndwi_mean    — float: mean NDWI (water-body proximity proxy)
+Output:
+    (B, 1, 64, 64) — per-pixel POI probability heatmap [0, 1]
+
+Output metadata populated by predict.py:
+    poi_score    — float [0, 1]: mean heatmap in top-10% pixels
+    dem_source   — str: 'real' or 'synthetic'
+    slope_mean   — float: mean slope angle for the tile
+    ndwi_mean    — float: mean NDWI (water index) for the tile
     class_name   — str: EuroSAT land-cover class
 """
 
-import sys
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from pretrained_model import ViTUNetPOI, count_parameters  # noqa: F401
+_EMBED_DIM   = 384   # matches CoreSatelliteModel._EMBED_DIM
+_KERNEL_SIZE = 7
+_SIGMA       = 1.5
 
 
-def _gaussian_kernel(kernel_size: int = 7, sigma: float = 1.5) -> torch.Tensor:
-    """Return a normalised 2-D Gaussian kernel as a (1, 1, k, k) tensor."""
-    coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+def _gaussian_kernel(size: int, sigma: float) -> torch.Tensor:
+    """Create a (1, 1, size, size) Gaussian blur kernel."""
+    coords = torch.arange(size, dtype=torch.float32) - size // 2
     g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-    g = g / g.sum()
-    kernel = torch.outer(g, g)          # (k, k)
-    return kernel.unsqueeze(0).unsqueeze(0)  # (1, 1, k, k)
+    k = torch.outer(g, g)
+    k = k / k.sum()
+    return k.unsqueeze(0).unsqueeze(0)
 
 
-class ElevationPOITransUNet(ViTUNetPOI):
-    """EVA-02 ViT-UNet with Gaussian heatmap head for cliff-water POI prediction.
+class _ConvBlock(nn.Module):
+    """Double 3×3 conv with BN+ReLU."""
 
-    Head architecture (replaces the base class 1×1 default):
-        Pointwise Conv2d(64, 1, 1×1)    — from base class self.head (logits)
-        Soft activation: sigmoid(x) * (1 + 0.1·x) — smooth gradients near zero,
-            avoids mode collapse to hard 0/1 for sparse heatmap targets
-        Fixed Gaussian blur (7×7, σ=1.5) — enforces spatial coherence to match
-            the Gaussian-convolved ground-truth heatmap generation process
-        clamp(0, 1)                      — ensure output stays in [0, 1]
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
 
-    The Gaussian kernel is registered as a non-trainable buffer so it moves
-    automatically to the correct device with .to(device) and is saved/loaded
-    with model checkpoints.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
-    Input:  (B, 6, 64, 64)  — RGB (3) + DEM elevation (1) + Slope (1) + Aspect (1)
-    Output: (B, 1, 64, 64)  — per-pixel POI probability heatmap [0, 1]
+
+class ElevationPOITransUNet(nn.Module):
+    """Elevation cliff-water POI submodel.
+
+    Architecture (trained from scratch):
+
+        RGB stream (from core features):
+            blk11 (B, 384, 16×16)  deepest ViT features
+              → proj11: Conv2d(384→128)
+              → dec_a: ConvBlock(128→128) @ 16×16
+              → upsample × 2  →  32×32
+              ↕ cat skip: proj5(blk5) @ 32×32 (64ch)
+              → dec_b: ConvBlock(128+64→64) @ 32×32
+              → upsample × 2  →  64×64
+
+        Topo stream (raw DEM+slope+aspect):
+            (B, 3, 64, 64)
+              → topo_enc1: ConvBlock(3→32) @ 64×64
+              → topo_enc2: ConvBlock(32→64) @ 64×64
+
+        Fusion:
+            cat(rgb_feat: B×64×64×64,  topo_feat: B×64×64×64)
+              → fusion: ConvBlock(128→64) @ 64×64
+              → head: Conv2d(64→1)
+              → soft activation: σ(x)·(1 + 0.1·x)   avoids hard saturation
+              → Gaussian blur (7×7, σ=1.5, fixed)    enforces spatial coherence
+              → clamp [0, 1]
+
+    Approximately 1.5M trainable parameters.
     """
 
-    _KERNEL_SIZE = 7
-    _SIGMA       = 1.5
+    def __init__(self, out_channels: int = 1):
+        super().__init__()
 
-    def __init__(self, in_channels: int = 6, out_channels: int = 1,
-                 freeze_backbone: bool = False):
-        super().__init__(in_channels=in_channels, out_channels=out_channels,
-                         freeze_backbone=freeze_backbone)
+        # ── RGB stream (processes core features) ──────────────────────────
+        self.proj11 = nn.Conv2d(_EMBED_DIM, 128, 1)
+        self.proj5  = nn.Conv2d(_EMBED_DIM,  64, 1)
 
-        # Register fixed Gaussian smoothing kernel as a non-trainable buffer.
-        # It saves/loads with the checkpoint and moves to GPU automatically.
-        self.register_buffer(
-            "_gauss_kernel",
-            _gaussian_kernel(self._KERNEL_SIZE, self._SIGMA),
-        )
-        # self.head (Conv2d 64→out_channels) inherited unchanged from base class.
+        self.dec_a = _ConvBlock(128, 128)               # 16×16
+        self.dec_b = _ConvBlock(128 + 64, 64)           # 32×32  (upsample + skip)
 
-    def _apply_head(self, x_c: torch.Tensor) -> torch.Tensor:
-        # 1. Project 64 channels → 1 channel (logits)
-        logits = self.head(x_c)                          # (B, 1, 64, 64)
+        # ── Topo stream (processes DEM + slope + aspect directly) ──────────
+        self.topo_enc1 = _ConvBlock(3, 32)              # 64×64
+        self.topo_enc2 = _ConvBlock(32, 64)             # 64×64
 
-        # 2. Soft activation — gentler than plain sigmoid for sparse heatmaps.
-        #    sigmoid(x) * (1 + 0.1·x) interpolates smoothly between near-zero
-        #    background and near-one peaks while keeping values in ~[0, 1].
-        sig = torch.sigmoid(logits)
-        pred = sig * (1.0 + 0.1 * logits)               # (B, 1, 64, 64)
+        # ── Fusion and heatmap head ────────────────────────────────────────
+        self.fusion = _ConvBlock(64 + 64, 64)           # cat(rgb, topo) → 64ch
+        self.head   = nn.Conv2d(64, out_channels, 1)
 
-        # 3. Gaussian smoothing — enforces spatial coherence of heatmap peaks.
-        padding = self._KERNEL_SIZE // 2
-        pred = F.conv2d(pred, self._gauss_kernel, padding=padding)
+        # Fixed Gaussian blur kernel — non-trainable, matches ground-truth generation
+        self.register_buffer("_gauss", _gaussian_kernel(_KERNEL_SIZE, _SIGMA))
 
-        return pred.clamp(0.0, 1.0)                      # (B, 1, 64, 64)
+    def forward(self, features: dict, topo: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            features: dict from CoreSatelliteModel.extract_features()  (RGB features)
+            topo:     (B, 3, 64, 64) — DEM elevation + slope + aspect channels
+
+        Returns:
+            (B, 1, 64, 64) per-pixel cliff-water POI heatmap [0, 1]
+        """
+        # ── RGB stream: decode core features from 16×16 → 64×64 ──────────
+        f11 = self.proj11(features["blk11"])   # (B, 128, 16, 16)
+        f5  = self.proj5(features["blk5"])     # (B,  64, 16, 16)
+
+        d = self.dec_a(f11)                    # (B, 128, 16, 16)
+
+        d = F.interpolate(d, scale_factor=2, mode="bilinear", align_corners=False)
+        f5_32 = F.interpolate(f5, scale_factor=2, mode="bilinear", align_corners=False)
+        d = self.dec_b(torch.cat([d, f5_32], dim=1))   # (B, 64, 32, 32)
+
+        d = F.interpolate(d, scale_factor=2, mode="bilinear", align_corners=False)
+        rgb_feat = d                            # (B, 64, 64, 64)
+
+        # ── Topo stream: encode DEM + slope + aspect ──────────────────────
+        t = self.topo_enc1(topo)               # (B, 32, 64, 64)
+        t = self.topo_enc2(t)                  # (B, 64, 64, 64)
+
+        # ── Fuse and predict ──────────────────────────────────────────────
+        fused  = self.fusion(torch.cat([rgb_feat, t], dim=1))   # (B, 64, 64, 64)
+        logits = self.head(fused)              # (B, 1, 64, 64)
+
+        # Soft activation: avoids hard saturation on sparse heatmap targets
+        sig  = torch.sigmoid(logits)
+        pred = sig * (1.0 + 0.1 * logits)     # slightly > 1.0 for high-confidence peaks
+
+        # Fixed Gaussian blur: enforces spatial coherence matching label generation
+        padding = _KERNEL_SIZE // 2
+        pred = F.conv2d(pred, self._gauss, padding=padding)
+
+        return pred.clamp(0.0, 1.0)
+
+
+def count_parameters(model: nn.Module) -> int:
+    """Count trainable parameters in the model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 if __name__ == "__main__":
-    model = ElevationPOITransUNet(in_channels=6, out_channels=1)
-    print(f"ElevationPOITransUNet (EVA-02 ViT-UNet + Gaussian heatmap head)")
+    from torch import randn
+
+    B = 2
+    dummy_features = {
+        "blk2":  randn(B, 384, 16, 16),
+        "blk5":  randn(B, 384, 16, 16),
+        "blk8":  randn(B, 384, 16, 16),
+        "blk11": randn(B, 384, 16, 16),
+        "cls":   randn(B, 384),
+    }
+    topo = randn(B, 3, 64, 64)
+
+    model = ElevationPOITransUNet()
+    out = model(dummy_features, topo)
+    print(f"ElevationPOITransUNet (elevation submodel)")
     print(f"  Trainable params: {count_parameters(model):,}")
-    x = torch.randn(2, 6, 64, 64)
-    pred, emb = model(x, return_embedding=True)
-    enc = model.encode(x)
-    print(f"  Input:     {tuple(x.shape)}  (RGB + DEM + Slope + Aspect)")
-    print(f"  Heatmap:   {tuple(pred.shape)}  range [{pred.min():.3f}, {pred.max():.3f}]")
-    print(f"  Embedding: {tuple(emb.shape)}")
-    print(f"  encode():  {tuple(enc.shape)}")
+    print(f"  Output shape:     {tuple(out.shape)}")
+    print(f"  Output range:     [{out.min():.3f}, {out.max():.3f}]")
+    print(f"\n  Input channels: blk11/blk5 from core (RGB) + topo (DEM+slope+aspect)")

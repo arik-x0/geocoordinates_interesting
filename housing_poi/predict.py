@@ -24,6 +24,7 @@ from tqdm import tqdm
 # Shared dataset module lives at the project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from dataset import get_housing_dataloaders as get_dataloaders  # noqa: E402
+from core.model import CoreSatelliteModel
 
 from model import HousingEdgeCNN
 from utils import (
@@ -80,11 +81,11 @@ def query_similar(embedding: np.ndarray, index, meta: List[dict],
 
 
 @torch.no_grad()
-def run_inference(model, test_loader, device, output_dir: Path, top_n: int = 20,
+def run_inference(core, submodel, test_loader, device, output_dir: Path, top_n: int = 20,
                   index=None, index_meta: Optional[List[dict]] = None,
                   top_k_similar: int = 5):
     """Run inference, rank by housing density, and save visualisations."""
-    model.eval()
+    submodel.eval()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = []
@@ -92,8 +93,9 @@ def run_inference(model, test_loader, device, output_dir: Path, top_n: int = 20,
     print("Running inference on test set...")
     for rgb_batch, label_batch, meta_batch in tqdm(test_loader, desc="Inference"):
         rgb_batch = rgb_batch.to(device)
-        predictions = model(rgb_batch)   # (B, 1, 64, 64)
-        embeddings  = model.encode(rgb_batch).cpu().numpy()  # (B, 512)
+        features    = core.extract_features(rgb_batch)
+        predictions = submodel(features)              # (B, 1, 64, 64)
+        embeddings  = core.encode(rgb_batch).cpu().numpy()  # (B, 512)
 
         for i in range(rgb_batch.size(0)):
             rgb_np       = rgb_batch[i].cpu().numpy()         # (3, 64, 64)
@@ -215,8 +217,8 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load model
-    model = HousingEdgeCNN(in_channels=3, out_channels=1).to(device)
+    core = CoreSatelliteModel().freeze().to(device)
+    submodel = HousingEdgeCNN(out_channels=1).to(device)
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
@@ -225,8 +227,8 @@ def main(args):
         return
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded model from {checkpoint_path}")
+    submodel.load_state_dict(checkpoint["submodel_state_dict"])
+    print(f"Loaded submodel from {checkpoint_path}")
     if "val_iou" in checkpoint:
         print(f"  Checkpoint IoU: {checkpoint['val_iou']:.4f} (epoch {checkpoint['epoch']})")
 
@@ -242,7 +244,8 @@ def main(args):
     )
 
     run_inference(
-        model=model,
+        core=core,
+        submodel=submodel,
         test_loader=test_loader,
         device=device,
         output_dir=Path(args.output_dir),
