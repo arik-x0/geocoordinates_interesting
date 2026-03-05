@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 # Shared dataset module lives at the project root
@@ -87,7 +88,7 @@ def run_inference(core, submodel, test_loader, device, output_dir: Path,
                   top_n: int = 20, index=None, index_meta=None,
                   top_k_similar: int = 5):
     """Run inference, rank by greenery score, query VectorDB, save visualizations."""
-    model.eval()
+    submodel.eval()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = []
@@ -97,7 +98,7 @@ def run_inference(core, submodel, test_loader, device, output_dir: Path,
         rgb_batch = rgb_batch.to(device)
         features    = core.extract_features(rgb_batch)
         predictions = submodel(features)            # (B, 1, 64, 64)
-        embeddings  = core.encode(rgb_batch)        # (B, 512) for VectorDB
+        embeddings  = F.normalize(features['cls'], p=2, dim=1)  # reuse cached CLS
 
         for i in range(rgb_batch.size(0)):
             rgb_np    = rgb_batch[i].cpu().numpy()          # (3, 64, 64)
@@ -202,7 +203,8 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = TransUNet(in_channels=3, out_channels=1).to(device)
+    core = CoreSatelliteModel().freeze().to(device)
+    submodel = TransUNet(out_channels=1).to(device)
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
@@ -211,12 +213,11 @@ def main(args):
         return
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded model from {checkpoint_path}")
+    submodel.load_state_dict(checkpoint["submodel_state_dict"])
+    print(f"Loaded submodel from {checkpoint_path}")
     if "val_iou" in checkpoint:
         print(f"  Checkpoint IoU: {checkpoint['val_iou']:.4f} (epoch {checkpoint['epoch']})")
 
-    # Load VectorDB index from the same checkpoint directory
     checkpoint_dir = checkpoint_path.parent
     index, index_meta = load_index(checkpoint_dir)
 

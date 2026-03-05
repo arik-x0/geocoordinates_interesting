@@ -133,11 +133,11 @@ class ElevationPOITransUNet(nn.Module):
 
         d = self.dec_a(f11)                    # (B, 128, 16, 16)
 
-        d = F.interpolate(d, scale_factor=2, mode="bilinear", align_corners=False)
-        f5_32 = F.interpolate(f5, scale_factor=2, mode="bilinear", align_corners=False)
+        d = F.interpolate(d, size=(32, 32), mode="bilinear", align_corners=False)
+        f5_32 = F.interpolate(f5, size=(32, 32), mode="bilinear", align_corners=False)
         d = self.dec_b(torch.cat([d, f5_32], dim=1))   # (B, 64, 32, 32)
 
-        d = F.interpolate(d, scale_factor=2, mode="bilinear", align_corners=False)
+        d = F.interpolate(d, size=(64, 64), mode="bilinear", align_corners=False)
         rgb_feat = d                            # (B, 64, 64, 64)
 
         # ── Topo stream: encode DEM + slope + aspect ──────────────────────

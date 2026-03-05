@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 # Shared dataset module lives at the project root
@@ -99,7 +100,7 @@ def run_inference(core, submodel, test_loader, device, output_dir: Path, top_n: 
         topo = input_batch[:, 3:]
         features    = core.extract_features(rgb)
         predictions = submodel(features, topo)   # (B, 1, 64, 64)
-        embeddings  = core.encode(rgb)           # (B, 512) for VectorDB
+        embeddings  = F.normalize(features['cls'], p=2, dim=1)  # reuse cached CLS
 
         for i in range(input_batch.size(0)):
             input_np  = input_batch[i].cpu().numpy()         # (6, 64, 64)
@@ -125,7 +126,7 @@ def run_inference(core, submodel, test_loader, device, output_dir: Path, top_n: 
                 "has_cliffs":     meta_batch[i]["has_cliffs"],
                 "water_fraction": meta_batch[i]["water_fraction"],
                 "max_slope":      meta_batch[i]["max_slope"],
-                "embedding":      embeddings[i].cpu().numpy(),  # (512,)
+                "embedding":      embeddings[i].cpu().numpy(),
             })
 
     # Sort by POI score (strongest cliff-water features first)
@@ -243,7 +244,8 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = ElevationPOITransUNet(in_channels=6, out_channels=1).to(device)
+    core = CoreSatelliteModel().freeze().to(device)
+    submodel = ElevationPOITransUNet(out_channels=1).to(device)
 
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
@@ -252,12 +254,11 @@ def main(args):
         return
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    print(f"Loaded model from {checkpoint_path}")
+    submodel.load_state_dict(checkpoint["submodel_state_dict"])
+    print(f"Loaded submodel from {checkpoint_path}")
     if "val_iou" in checkpoint:
         print(f"  Checkpoint IoU: {checkpoint['val_iou']:.4f} (epoch {checkpoint['epoch']})")
 
-    # Load VectorDB index from the same checkpoint directory
     checkpoint_dir = checkpoint_path.parent
     index, index_meta = load_index(checkpoint_dir)
 

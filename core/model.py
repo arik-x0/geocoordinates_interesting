@@ -23,28 +23,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_BACKBONE_ID = "eva02_small_patch14_224"
-_EMBED_DIM   = 384     # EVA-02 ViT-S hidden dimension
-_GRID_SIZE   = 16      # 224px / 14px patch = 16 spatial tokens per axis
+_BACKBONE_ID = "vit_small_patch16_224.dino"
+_EMBED_DIM   = 384     # ViT-S hidden dimension
+_GRID_SIZE   = 14      # 224px / 16px patch = 14 spatial tokens per axis
 _HOOK_BLOCKS = (2, 5, 8, 11)  # tap features at 1/4, 2/4, 3/4, full depth
 
 
 class CoreSatelliteModel(nn.Module):
-    """EVA-02 ViT-S/14 frozen backbone for satellite image feature extraction.
+    """DINO ViT-S/16 frozen backbone for satellite image feature extraction.
 
     Architecture:
         Input  (B, 3, 64, 64) RGB satellite tile
           ↓  Bilinear resize → 224×224
-          ↓  EVA-02 ViT-S/14  (12 blocks, embed_dim=384, 6 heads, patch_size=14)
+          ↓  ViT-S/16  (12 blocks, embed_dim=384, 6 heads, patch_size=16)
              Forward hooks capture intermediate outputs at blocks 2, 5, 8, 11
-          ↓  _tokens_to_spatial: (B, 257, 384) → (B, 384, 16, 16)
+          ↓  _tokens_to_spatial: (B, 197, 384) → (B, 384, 14, 14)
 
     extract_features() returns a dict of spatial maps, one per hooked block,
     plus the CLS token.  Submodels consume these maps and add their own
     decoders trained from scratch.
 
-    encode() skips the spatial reshape and returns a 512-dim L2-normalised
-    CLS-token embedding for FAISS nearest-neighbour retrieval.
+    encode() returns a 384-dim L2-normalised CLS-token embedding for FAISS
+    nearest-neighbour retrieval.  If extract_features() was just called on the
+    same batch, the cached CLS token is reused — no second backbone pass.
     """
 
     def __init__(self):
@@ -61,23 +62,20 @@ class CoreSatelliteModel(nn.Module):
                 lambda _m, _inp, out, i=idx: self._feat_cache.__setitem__(i, out)
             )
 
-        # CLS-token projection for FAISS (384 → 512)
-        self.embed_proj = nn.Linear(_EMBED_DIM, 512)
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _tokens_to_spatial(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Reshape (B, N+1, D) token sequence → (B, D, 16, 16) spatial map.
+        """Reshape (B, N+1, D) token sequence → (B, D, 14, 14) spatial map.
 
-        Drops the CLS token and reshapes the N=256 patch tokens to 2-D.
+        Drops the CLS token and reshapes the N=196 patch tokens to 2-D.
         """
         B = tokens.shape[0]
         return (
-            tokens[:, 1:]                                            # (B, 256, D)
-            .transpose(1, 2)                                         # (B, D, 256)
-            .reshape(B, _EMBED_DIM, _GRID_SIZE, _GRID_SIZE)         # (B, D, 16, 16)
+            tokens[:, 1:]                                            # (B, 196, D)
+            .transpose(1, 2)                                         # (B, D, 196)
+            .reshape(B, _EMBED_DIM, _GRID_SIZE, _GRID_SIZE)         # (B, D, 14, 14)
         )
 
     def _run_backbone(self, x_224: torch.Tensor):
@@ -121,23 +119,24 @@ class CoreSatelliteModel(nn.Module):
         }
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract a 512-dim L2-normalised embedding from the CLS token.
+        """Extract a 384-dim L2-normalised CLS embedding for FAISS retrieval.
 
-        Faster than extract_features() — skips the spatial reshape.
-        Use this for building and querying the FAISS VectorDB index.
+        Prefer reusing features['cls'] from a recent extract_features() call
+        to avoid a redundant backbone forward pass:
+            features   = core.extract_features(rgb)
+            embeddings = F.normalize(features['cls'], p=2, dim=1)
 
         Args:
             x: (B, 3, 64, 64) RGB tile.
 
         Returns:
-            (B, 512) L2-normalised float32 embedding.
+            (B, 384) L2-normalised float32 embedding.
         """
         x_224 = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
         self._feat_cache.clear()
-        final = self.backbone.forward_features(x_224)   # (B, 257, 384)
+        final = self.backbone.forward_features(x_224)   # (B, 197, 384)
         cls   = final[:, 0]                              # (B, 384)
-        emb   = self.embed_proj(cls)                     # (B, 512)
-        return F.normalize(emb, p=2, dim=1)
+        return F.normalize(cls, p=2, dim=1)
 
     def freeze(self):
         """Freeze all backbone parameters. Call before submodel training."""
@@ -158,7 +157,6 @@ if __name__ == "__main__":
     total = sum(p.numel() for p in core.parameters())
     print(f"CoreSatelliteModel  total params: {total:,}")
     print(f"  backbone: {sum(p.numel() for p in core.backbone.parameters()):,}")
-    print(f"  embed_proj: {sum(p.numel() for p in core.embed_proj.parameters()):,}")
 
     core.freeze()
     dummy = torch.randn(2, 3, 64, 64)

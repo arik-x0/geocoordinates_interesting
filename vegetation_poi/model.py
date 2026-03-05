@@ -114,13 +114,13 @@ class TransUNet(nn.Module):
         d = self.dec_a(f11)                    # (B, 256, 16, 16)
 
         # Decoder stage B: upsample → 32×32, fuse with mid-level skip
-        d = F.interpolate(d, scale_factor=2, mode="bilinear", align_corners=False)
-        f5_32 = F.interpolate(f5, scale_factor=2, mode="bilinear", align_corners=False)
+        d = F.interpolate(d, size=(32, 32), mode="bilinear", align_corners=False)
+        f5_32 = F.interpolate(f5, size=(32, 32), mode="bilinear", align_corners=False)
         d = self.dec_b(torch.cat([d, f5_32], dim=1))   # (B, 128, 32, 32)
 
         # Decoder stage C: upsample → 64×64, fuse with fine skip
-        d = F.interpolate(d, scale_factor=2, mode="bilinear", align_corners=False)
-        f2_64 = F.interpolate(f2, scale_factor=4, mode="bilinear", align_corners=False)
+        d = F.interpolate(d, size=(64, 64), mode="bilinear", align_corners=False)
+        f2_64 = F.interpolate(f2, size=(64, 64), mode="bilinear", align_corners=False)
         d = self.dec_c(torch.cat([d, f2_64], dim=1))   # (B, 64, 64, 64)
 
         # SE channel-attention: re-weight channels by global relevance

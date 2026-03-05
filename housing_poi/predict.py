@@ -19,6 +19,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 # Shared dataset module lives at the project root
@@ -95,7 +96,7 @@ def run_inference(core, submodel, test_loader, device, output_dir: Path, top_n: 
         rgb_batch = rgb_batch.to(device)
         features    = core.extract_features(rgb_batch)
         predictions = submodel(features)              # (B, 1, 64, 64)
-        embeddings  = core.encode(rgb_batch).cpu().numpy()  # (B, 512)
+        embeddings  = F.normalize(features['cls'], p=2, dim=1)  # reuse cached CLS
 
         for i in range(rgb_batch.size(0)):
             rgb_np       = rgb_batch[i].cpu().numpy()         # (3, 64, 64)
@@ -113,7 +114,7 @@ def run_inference(core, submodel, test_loader, device, output_dir: Path, top_n: 
                 "filepath":       meta_batch[i]["filepath"],
                 "is_residential": meta_batch[i]["is_residential"],
                 "ndbi_mean":      meta_batch[i]["ndbi_mean"],
-                "embedding":      embeddings[i],
+                "embedding":      embeddings[i].cpu().numpy(),
             })
 
     # ── Partition results ────────────────────────────────────────────────────
