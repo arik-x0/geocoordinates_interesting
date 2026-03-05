@@ -15,14 +15,17 @@ Scoring:
     i.e. 5% to 20% of the image is built-up.
 """
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import torch
-from pathlib import Path
 from scipy.ndimage import sobel, binary_closing, binary_dilation
 
-from constants import (
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from constants import (  # noqa: E402
     BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR, BAND_SWIR,
     HOUSING_DENSITY_MIN, HOUSING_DENSITY_MAX,
     NDBI_THRESHOLD, GRADIENT_WEIGHT, CLOSING_SIZE,

@@ -5,6 +5,7 @@ POI heatmap generation, and visualization.
 """
 
 import os
+import sys
 import zipfile
 import urllib.request
 import math
@@ -18,7 +19,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.ndimage import distance_transform_edt, gaussian_filter
 
-from constants import (
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from constants import (  # noqa: E402
     BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR,
     NDWI_WATER_THRESHOLD, CLIFF_SLOPE_THRESHOLD, POI_PROXIMITY_SIGMA,
     POI_TOP_PERCENTILE,

@@ -3,13 +3,16 @@ Utility functions for satellite greenery analysis.
 NDVI computation, greenery scoring, and visualization helpers.
 """
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import torch
-from pathlib import Path
 
-from constants import (
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from constants import (  # noqa: E402
     BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR,
     NDVI_GREENERY_THRESHOLD, GREENERY_THRESHOLD,
 )
