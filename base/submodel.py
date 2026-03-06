@@ -15,7 +15,7 @@ _EMBED_DIM = 384   # must match CoreSatelliteModel._EMBED_DIM
 
 
 class _ConvBlock(nn.Module):
-    """Double 3×3 conv with BN+ReLU — shared decoder primitive."""
+    """Double 3x3 conv with BN+ReLU -- shared decoder primitive."""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
@@ -42,11 +42,6 @@ class BaseSubmodel(nn.Module):
     Subclasses define their own projection layers (proj*), decoder
     ConvBlocks (dec_*), and output heads, then compose them using
     _upsample_cat inside forward().
-
-    Example (3-stage decode):
-        d = self.dec_a(f_deep)
-        d = self.dec_b(self._upsample_cat(d, f_mid, (32, 32)))
-        d = self.dec_c(self._upsample_cat(d, f_shallow, (64, 64)))
     """
 
     @staticmethod

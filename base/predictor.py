@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.model import CoreSatelliteModel  # noqa: E402
-from base.utils import VectorDB  # noqa: E402
+from base.utils import VectorDB            # noqa: E402
 
 
 class BasePredictor:
@@ -41,7 +41,7 @@ class BasePredictor:
     def __init__(self, args):
         self.args = args
 
-    # ── Abstract interface ──────────────────────────────────────────────────
+    # -- Abstract interface --------------------------------------------------
 
     def get_test_loader(self):
         """Return the test DataLoader."""
@@ -68,7 +68,7 @@ class BasePredictor:
         """Write per-result and overview PNG files to output_dir."""
         raise NotImplementedError
 
-    # ── Optional overrides ──────────────────────────────────────────────────
+    # -- Optional overrides --------------------------------------------------
 
     def rgb_slice(self, inputs: torch.Tensor) -> torch.Tensor:
         """Return the RGB portion of a batch tensor (default: full input)."""
@@ -88,7 +88,7 @@ class BasePredictor:
             print(f"  {s['similarity']:>6.4f}  {s['split']:<6}  "
                   f"{s['class_name']:<20}  {Path(s['filepath']).name}")
 
-    # ── Core inference loop ─────────────────────────────────────────────────
+    # -- Core inference loop -------------------------------------------------
 
     @torch.no_grad()
     def run_inference(self, core, submodel, test_loader, device,
@@ -142,16 +142,14 @@ class BasePredictor:
         print(f"\nAll outputs saved to: {output_dir}/")
         return all_results
 
-    # ── Main entry point ────────────────────────────────────────────────────
+    # -- Main entry point ----------------------------------------------------
 
     def run(self):
         args   = self.args
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
-        # Load core (backbone frozen, decoder loaded from checkpoint)
-        core = CoreSatelliteModel().freeze().to(device)
-
+        core     = CoreSatelliteModel().freeze().to(device)
         submodel = self.build_submodel().to(device)
 
         checkpoint_path = Path(args.checkpoint)
@@ -162,12 +160,11 @@ class BasePredictor:
 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
-        # Load shared decoder state (trained jointly with the submodel)
         if "decoder_state_dict" in ckpt:
             core.decoder.load_state_dict(ckpt["decoder_state_dict"])
-            print(f"Loaded shared decoder from checkpoint.")
+            print("Loaded shared decoder from checkpoint.")
         else:
-            print("WARNING: checkpoint has no decoder_state_dict — "
+            print("WARNING: checkpoint has no decoder_state_dict -- "
                   "using randomly initialised decoder.")
 
         submodel.load_state_dict(ckpt["submodel_state_dict"])
@@ -175,7 +172,6 @@ class BasePredictor:
         if "val_iou" in ckpt:
             print(f"  val_iou={ckpt['val_iou']:.4f} (epoch {ckpt['epoch']})")
 
-        # VectorDB (optional — built at the end of training)
         checkpoint_dir = checkpoint_path.parent
         vdb = VectorDB.load(checkpoint_dir)
 

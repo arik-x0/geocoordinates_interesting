@@ -45,8 +45,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from training_utils import compute_iou, compute_dice, build_embedding_index  # noqa: E402
-from core.model import CoreSatelliteModel  # noqa: E402
-from submodels.base import count_parameters  # noqa: E402
+from core.model import CoreSatelliteModel                                     # noqa: E402
+from base.submodel import count_parameters                                    # noqa: E402
 
 
 class BaseTrainer:
@@ -64,7 +64,7 @@ class BaseTrainer:
     def __init__(self, args):
         self.args = args
 
-    # ── Abstract interface ──────────────────────────────────────────────────
+    # -- Abstract interface --------------------------------------------------
 
     def get_dataloaders(self):
         """Return (train_loader, val_loader, test_loader)."""
@@ -78,7 +78,7 @@ class BaseTrainer:
         """Return the loss function for this task."""
         raise NotImplementedError
 
-    # ── Optional overrides ──────────────────────────────────────────────────
+    # -- Optional overrides --------------------------------------------------
 
     def rgb_slice(self, inputs: torch.Tensor) -> torch.Tensor:
         """Return the RGB channels from a batch tensor (default: full input)."""
@@ -107,7 +107,7 @@ class BaseTrainer:
     def add_args(cls, parser):
         """Register task-specific CLI arguments. Override as needed."""
 
-    # ── Training loop ───────────────────────────────────────────────────────
+    # -- Training loop -------------------------------------------------------
 
     def _train_one_epoch(self, core, submodel, loader, criterion, optimizer, device):
         core.decoder.train()
@@ -166,7 +166,7 @@ class BaseTrainer:
             n_batches  += 1
         return total_loss / n_batches, total_iou / n_batches, total_dice / n_batches
 
-    # ── Main entry point ────────────────────────────────────────────────────
+    # -- Main entry point ----------------------------------------------------
 
     def run(self):
         args   = self.args

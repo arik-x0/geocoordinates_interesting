@@ -1,6 +1,35 @@
 # geo_interesting
 
-Satellite imagery analysis project with three independent ML pipelines, each detecting a different type of Point of Interest (POI) from EuroSAT Sentinel-2 64×64 tiles.
+Satellite imagery analysis project with three independent ML pipelines, each detecting a different type of Point of Interest (POI) from EuroSAT Sentinel-2 64x64 tiles.
+
+---
+
+## Architecture Overview
+
+The project uses a **shared representation + task-specific heads** design. A single pretrained backbone + shared decoder produces a rich spatial feature map that all three submodels consume. Each submodel adds only a thin, task-specific head on top.
+
+```
+Input (B, 3, 64, 64) RGB
+        |
+        v
+  CoreSatelliteModel              [core/model.py]
+  ├── DINO ViT-S/16  (FROZEN)     — pretrained backbone, never updated
+  │   └── hooks at blocks 2/5/8/11 → (B, 384, 14, 14) token maps
+  └── _SharedDecoder (TRAINABLE)  — trained jointly with each task head
+      14x14 → 32x32 → 64x64 via skip connections
+      output: (B, 128, 64, 64) feature map
+        |
+        ├──> TransUNet head         (vegetation)   → (B, 1, 64, 64) heatmap
+        ├──> HousingEdgeCNN head    (housing)      → (B, 1, 64, 64) heatmap
+        └──> ElevationPOITransUNet  (elevation)    → (B, 1, 64, 64) heatmap
+             + topo CNN (DEM/slope/aspect)
+```
+
+Training flow per submodel:
+1. Backbone runs under `torch.no_grad()` — no graph, no gradient
+2. Shared decoder runs normally — gradients flow, weights update
+3. Task head runs normally — gradients flow, weights update
+4. `optimizer = Adam(decoder.parameters() + head.parameters())`
 
 ---
 
@@ -8,173 +37,194 @@ Satellite imagery analysis project with three independent ML pipelines, each det
 
 ```
 geo_interesting/
+|
 ├── core/
-│   ├── __init__.py
-│   └── model.py            ← CoreSatelliteModel (EVA-02 ViT-S/14, frozen)
-├── constants.py            ← band indices, thresholds, scoring constants
-├── training_utils.py       ← shared loss functions, metrics, augmentation
-├── dataset.py              ← shared dataset module (all 3 models)
-├── requirements.txt
-├── vegetation_poi/         ← NDVI greenery segmentation
-│   ├── model.py            ← TransUNet submodel (trained from scratch)
-│   ├── train.py
-│   ├── predict.py
-│   └── utils.py
-├── elevation_poi/          ← cliff-near-water heatmap detection
-│   ├── model.py            ← ElevationPOITransUNet submodel (trained from scratch)
-│   ├── train.py
-│   ├── predict.py
-│   └── utils.py
-└── housing_poi/            ← low-density building edge detection
-    ├── model.py            ← HousingEdgeCNN submodel (trained from scratch)
-    ├── train.py
-    ├── predict.py
-    └── utils.py
+│   └── model.py                  ← CoreSatelliteModel
+│                                    - DINO ViT-S/16 backbone (frozen)
+│                                    - _SharedDecoder (trainable, shared)
+│                                    - extract_features() / decode() / encode()
+│
+├── base/                         ← shared abstract infrastructure
+│   ├── submodel.py               ← BaseSubmodel, _ConvBlock, count_parameters
+│   ├── trainer.py                ← BaseTrainer  (Template Method pattern)
+│   ├── predictor.py              ← BasePredictor (Template Method pattern)
+│   └── utils.py                  ← VectorDB (FAISS cosine similarity index)
+│
+├── submodels/
+│   ├── vegetation/               ← greenery coverage detection
+│   │   ├── model.py              ← TransUNet (SE channel-attention head, ~0.2M params)
+│   │   ├── trainer.py            ← VegetationTrainer
+│   │   ├── predictor.py          ← VegetationPredictor
+│   │   ├── utils.py              ← NDVI, greenery scoring, visualization
+│   │   └── __main__.py           ← CLI entry point
+│   │
+│   ├── housing/                  ← built-up structure detection
+│   │   ├── model.py              ← HousingEdgeCNN (HED-style head, ~0.07M params)
+│   │   ├── trainer.py            ← HousingTrainer
+│   │   ├── predictor.py          ← HousingPredictor
+│   │   ├── utils.py              ← NDBI, structure labels, visualization
+│   │   └── __main__.py           ← CLI entry point
+│   │
+│   └── elevation/                ← cliff-near-water POI detection
+│       ├── model.py              ← ElevationPOITransUNet (topo-fusion head, ~0.35M params)
+│       ├── trainer.py            ← ElevationTrainer
+│       ├── predictor.py          ← ElevationPredictor
+│       ├── utils.py              ← DEM, slope/aspect, water detection, visualization
+│       └── __main__.py           ← CLI entry point
+│
+├── constants.py                  ← band indices, thresholds, scoring constants
+├── training_utils.py             ← shared losses, metrics, FAISS index builder
+└── dataset.py                    ← dataset loaders for all three tasks
 ```
+
+### Design principles
+
+| Principle | Applied via |
+|---|---|
+| Single Responsibility | Each file has exactly one job (model / trainer / predictor / utils) |
+| Open/Closed | Adding a new submodel = new folder only, zero changes to existing code |
+| Template Method | `BaseTrainer` and `BasePredictor` define the algorithm skeleton; subclasses fill in hooks |
+| Dependency Inversion | All trainers/predictors depend on abstract base classes, not each other |
+| Separation of Concerns | Domain logic (NDVI, NDBI, DEM) is isolated from ML infrastructure |
 
 ---
 
-## Model Architectures
+## Core Model
 
-### Core — EVA-02 ViT-S/14 (`core/model.py`, frozen, MIT license)
+### DINO ViT-S/16 backbone (`vit_small_patch16_224.dino` via timm)
 
-Pretrained with masked image modelling on ImageNet-22K (BAAI). Loaded via `timm`.
-Provides multi-scale satellite image features to all three submodels.
+Pretrained with self-supervised DINO on ImageNet. Always frozen during training.
+
+- `embed_dim = 384`, `patch_size = 16`, spatial grid = `14x14`
+- Forward hooks at blocks 2, 5, 8, 11 capture `(B, 384, 14, 14)` token maps
+- CLS token `(B, 384)` used for VectorDB embeddings via L2-normalisation
+
+### Shared UNet decoder (`_SharedDecoder`)
+
+Trainable. Lives inside `CoreSatelliteModel`. Shared across all task heads.
 
 ```
-Input (B, 3, 64, 64) RGB satellite tile
-  ↓  Bilinear resize → 224×224
-  ↓  EVA-02 ViT-S/14  (12 blocks, embed_dim=384, 6 heads, patch_size=14)
-     Forward hooks capture block outputs at depths 2, 5, 8, 11
-     Each reshaped from (B, 257, 384) → (B, 384, 16, 16)
-
-  extract_features() returns dict:
-      blk2   (B, 384, 16×16)  — low-level visual features
-      blk5   (B, 384, 16×16)  — mid-level features
-      blk8   (B, 384, 16×16)  — deep features
-      blk11  (B, 384, 16×16)  — deepest semantic features
-      cls    (B, 384)          — global CLS descriptor
-
-  encode() → Linear(384→512) + L2-norm → (B, 512) FAISS embedding
+blk11 (B, 384, 14x14) → proj11 → (B, 256, 14x14)
+                                        ↓ dec_a
+                              (B, 256, 14x14) + upsample
+blk8  (B, 384, 14x14) → proj8  → concat → dec_b → (B, 128, 32x32)
+                                                          ↓ + upsample
+blk2  (B, 384, 14x14) → proj2  → concat → dec_c → (B, 128, 64x64)
+                                                          ↓
+                                               feature_map (B, 128, 64x64)
 ```
 
-The core runs under `torch.no_grad()` during all submodel training.
-Its weights are never updated.
+Output `_DEC_CHANNELS = 128` is the shared constant consumed by all task heads.
 
-### Submodels — all trained entirely from scratch
+---
 
-Each submodel receives the core feature dict and adds its own trainable decoder + head.
+## Submodels
 
-| Model | Architecture | Task Head | Params |
+All three submodels receive `(B, 128, 64, 64)` from the shared decoder and output `(B, 1, 64, 64)`.
+
+| Submodel | Head architecture | Params | Task |
 |---|---|---|---|
-| **Vegetation** `TransUNet` | 3-stage U-Net: proj(384→256/128/64) + bilinear 16→32→64 | SE channel-attention + Conv(64→1) + Sigmoid | ~2.5M |
-| **Housing** `HousingEdgeCNN` | 3-stage U-Net + side outputs at 16/32/64 | Depthwise edge conv + HED fusion | ~2.2M |
-| **Elevation** `ElevationPOITransUNet` | 2-stage RGB decoder + topo CNN (3→32→64ch) | Gaussian heatmap head | ~1.5M |
+| `TransUNet` | ConvBlock(128→64) + SE channel-attention + Conv(64→1) | ~0.2M | Vegetation segmentation |
+| `HousingEdgeCNN` | Direct side + depthwise edge side + fusion Conv(2→1) | ~0.07M | Structure density |
+| `ElevationPOITransUNet` | proj(128→64) + topo CNN(3→32→64) + fusion + Gaussian blur | ~0.35M | Cliff-water POI heatmap |
 
-#### Elevation dual-stream architecture
-
-```
-RGB stream (frozen core)               Topo stream (from scratch)
-blk11 (384ch, 16×16)                   DEM + Slope + Aspect (3ch, 64×64)
-  → proj+dec_a → 128ch @ 16×16           → topo_enc1 → 32ch @ 64×64
-  → dec_b+skip → 64ch  @ 32×32           → topo_enc2 → 64ch @ 64×64
-  → upsample   → 64ch  @ 64×64    ↘
-                                          cat → fusion(128→64) → heatmap head
-                                               → (B, 1, 64, 64)
-```
+The elevation submodel is unique in taking a second input: `topo (B, 3, 64, 64)` containing DEM elevation, slope, and aspect channels.
 
 ---
 
 ## Ground Truth (Pseudo-labels)
 
-None of the three models use manual annotations:
+No manual annotations are used. Labels are derived from spectral/topographic signals:
 
-| Model | Label Generation |
+| Task | Label generation |
 |---|---|
-| Vegetation | NDVI from bands 4 & 8 → threshold at 0.3 |
-| Elevation | SRTM DEM → slope/aspect → NDWI water mask → Gaussian-weighted POI heatmap |
+| Vegetation | NDVI from bands 4 & 8, threshold at 0.3 |
 | Housing | NDBI from bands 11 & 8 + Sobel gradient → threshold + morphological closing |
+| Elevation | SRTM DEM → slope/aspect → NDWI water mask → Gaussian-weighted POI heatmap |
 
 ---
 
 ## Training
 
-All three models share the same training loop structure: Adam optimizer, `ReduceLROnPlateau` scheduler (patience=3, factor=0.5), IoU/Dice metrics, best-model checkpoint, and per-epoch JSON logs.
+All three submodels share the same training loop from `BaseTrainer`:
+- `Adam(decoder.parameters() + head.parameters())`, weight_decay=1e-4
+- `ReduceLROnPlateau` scheduler (patience=3, factor=0.5)
+- IoU + Dice metrics, best-model checkpoint, per-epoch JSON log
+- FAISS VectorDB built from L2-normalised CLS embeddings at end of training
 
 ### Loss Functions
 
-| Model | Loss |
+| Task | Loss |
 |---|---|
-| Vegetation | DiceBCE |
-| Elevation | MSE+Dice |
-| Housing | DiceBCE only |
+| Vegetation | DiceBCE (dice_weight=0.5) |
+| Housing | DiceBCE (dice_weight=0.5) |
+| Elevation | MSE + soft-Dice (equal weight) |
 
-Because the core is frozen during submodel training, contrastive loss is not applied — gradients cannot propagate to the embedding backbone. FAISS similarity search uses EVA-02 CLS-token embeddings directly, which are shaped by the backbone's masked image modelling pretraining.
-
-After training, vegetation and elevation build a **FAISS IndexFlatIP** over all splits. Inner product on L2-normalized vectors equals cosine similarity, enabling fast nearest-neighbour retrieval by visual and spectral/topographic similarity.
-
-### Key Hyperparameters
+### Key CLI Arguments
 
 | Argument | Default | Description |
 |---|---|---|
-| `--epochs` | 25 | Number of training epochs |
-| `--batch-size` | 32 (veg) / 16 (elev, housing) | Batch size |
+| `--epochs` | 25 | Training epochs |
+| `--batch-size` | 32 (veg) / 16 (housing, elev) | Batch size |
 | `--lr` | 1e-3 | Initial learning rate |
 | `--ndvi-threshold` | 0.3 | Vegetation pseudo-label threshold |
-| `--cliff-threshold` | 15.0° | Slope angle for cliff classification |
-| `--water-threshold` | 0.3 | NDWI threshold for water detection |
+| `--use-real-dem` | false | Use real SRTM DEM (elevation only) |
 
-### Running Training
+### Checkpoint format
 
-```bash
-# Vegetation
-cd vegetation_poi
-python train.py --data-dir data --checkpoint-dir checkpoints
-
-# Elevation
-cd elevation_poi
-python train.py --data-dir data --checkpoint-dir checkpoints --use-real-dem
-
-# Housing
-cd housing_poi
-python train.py --data-dir data --checkpoint-dir checkpoints
+```python
+{
+    "epoch":                int,
+    "decoder_state_dict":   ...,   # shared decoder weights
+    "submodel_state_dict":  ...,   # task head weights
+    "optimizer_state_dict": ...,
+    "val_iou":              float,
+    "val_dice":             float,
+    "val_loss":             float,
+}
 ```
 
-### Running Inference
+---
+
+## Running
+
+All commands run from the project root:
 
 ```bash
 # Vegetation
-cd vegetation_poi
-python predict.py --checkpoint checkpoints/best_model.pth --data-dir data
-
-# Elevation
-cd elevation_poi
-python predict.py --checkpoint checkpoints/best_model.pth --data-dir data --top-k-similar 5
+python -m submodels.vegetation train   --epochs 25 --data-dir data
+python -m submodels.vegetation predict --checkpoint checkpoints/vegetation/best_model.pth
 
 # Housing
-cd housing_poi
-python predict.py --checkpoint checkpoints/best_model.pth --data-dir data
+python -m submodels.housing train   --epochs 25 --data-dir data
+python -m submodels.housing predict --checkpoint checkpoints/housing/best_model.pth
+
+# Elevation (synthetic DEM)
+python -m submodels.elevation train   --epochs 25 --data-dir data
+# Elevation (real SRTM DEM)
+python -m submodels.elevation train   --epochs 25 --data-dir data --use-real-dem
+python -m submodels.elevation predict --checkpoint checkpoints/elevation/best_model.pth
 ```
 
 ---
 
 ## Outputs
 
-Each `predict.py` saves to an `output/` directory:
+Each predictor saves to `output/<task>/`:
 
-- Per-image visualizations ranked by POI score (top-N and bottom-5)
-- A ranking overview grid image
-- Console tables with per-class POI statistics
-- VectorDB similarity search results for the top predictions (all three models)
+- Per-image visualizations ranked by score (top-N and bottom-5)
+- Ranking overview grid image
+- Console table with per-class statistics
+- VectorDB similarity search results for the top predictions
 
-Checkpoints saved by `train.py`:
+Checkpoint files:
 
 | File | Contents |
 |---|---|
-| `best_model.pth` | Model + optimizer state at best validation IoU |
-| `final_model.pth` | Model + optimizer state after last epoch |
-| `training_log.json` | Per-epoch metrics, timing, and `is_best` flag |
-| `embedding_index.faiss` | FAISS index built from best model (all three models) |
+| `best_model.pth` | Decoder + head + optimizer at best validation IoU |
+| `final_model.pth` | Decoder + head + optimizer after last epoch |
+| `training_log.json` | Per-epoch metrics, timing, `is_best` flag |
+| `embedding_index.faiss` | FAISS cosine index over L2-normalised CLS embeddings |
 | `embedding_meta.json` | Per-vector metadata aligned with FAISS index |
 
 ---
@@ -183,49 +233,15 @@ Checkpoints saved by `train.py`:
 
 ```
 torch>=2.0.0
-timm>=0.9.2        # EVA-02 pretrained backbone (MIT license)
+timm>=0.9.2        # DINO ViT-S/16 pretrained backbone
 numpy>=1.24.0
-rasterio>=1.3.0
 matplotlib>=3.7.0
 tqdm>=4.65.0
 Pillow>=9.5.0
 scipy>=1.10.0
-pyproj>=3.5.0
 faiss-cpu>=1.7.0   # optional — required for VectorDB similarity search
 ```
-
-The EVA-02 ViT-S/14 weights are downloaded automatically by `timm` on first run (MIT license, BAAI).
-
-Install with:
 
 ```bash
 pip install -r requirements.txt
 ```
-
----
-
-## TODO
-
-### Critical
-
-- [x] **Centralise band indices** — `BAND_RED`, `BAND_NIR`, etc. are declared identically in all three `utils.py` files and again in `dataset.py`. Extract into a single `constants.py` to eliminate the risk of silent divergence across four locations.
-
-- [x] **Improve contrastive positives** — NT-Xent currently uses EuroSAT class names as positive pairs. This is semantically weak: the `"Industrial"` class contains highways, mines, and factories. Replace with augmentation-based pairs (two augmented views of the same tile) or learned similarity, rather than coarse class labels.
-
-- [x] **Add `encode()` and VectorDB to the Housing model** — The housing pipeline has no embedding extraction, making cross-model or intra-model similarity search impossible. Implement `encode()` on `HousingEdgeCNN` and build a FAISS index post-training, consistent with the other two models.
-
-### Moderate
-
-- [x] **Log and track synthetic DEM fallback** — When SRTM download fails, `generate_synthetic_dem()` is used silently. Add a warning and record the DEM source (`"real"` / `"synthetic"`) in the per-sample metadata and training log so embedding quality degradation can be traced.
-
-- [x] **Extract shared training boilerplate** — `train_one_epoch()`, `validate()`, `compute_iou()`, and `compute_dice()` are largely copy-pasted across all three `train.py` files. Move into a shared `training_utils.py` to reduce maintenance surface.
-
-- [x] **Handle all-zero channel normalisation** — `normalize_channel()` returns an all-zeros array when a tile has zero variance (e.g. a fully flat DEM tile). This corrupts the 6-channel input silently. Add a warning and a fallback (e.g. return the raw channel or a small noise floor).
-
-### Minor
-
-- [x] **Centralise magic-number thresholds** — `compute_poi_score()` hardcodes the top-10% pixel cutoff; housing density thresholds (5%–20%) are scattered across `utils.py`. Move to named constants or expose as CLI arguments.
-
-- [x] **Remove unused dependencies** — `torchvision` and `scikit-learn` are listed in `requirements.txt` but not used anywhere in the codebase.
-
-- [x] **Tune NT-Xent temperature** — τ=0.07 is the ViT paper default and has not been ablated for satellite imagery. Consider adding a short sweep over τ ∈ {0.05, 0.07, 0.1, 0.2} to confirm the default is appropriate.

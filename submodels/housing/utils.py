@@ -22,7 +22,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import torch
-from scipy.ndimage import sobel, binary_closing, binary_dilation
+from scipy.ndimage import sobel, binary_closing
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from constants import (  # noqa: E402
@@ -37,7 +37,6 @@ def compute_ndbi(nir: np.ndarray, swir: np.ndarray) -> np.ndarray:
 
     NDBI = (SWIR - NIR) / (SWIR + NIR)
     Positive values indicate built-up areas (rooftops, roads, pavements).
-    Vegetation has negative NDBI, water strongly negative.
     """
     nir  = nir.astype(np.float32)
     swir = swir.astype(np.float32)
@@ -58,26 +57,11 @@ def generate_structure_label(all_bands: np.ndarray,
                              ndbi_threshold: float = NDBI_THRESHOLD,
                              gradient_weight: float = GRADIENT_WEIGHT,
                              closing_size:    int   = CLOSING_SIZE) -> np.ndarray:
-    """Generate a per-pixel built-up / structure label from 13-band Sentinel-2 data.
-
-    Pipeline:
-        1. NDBI from SWIR (band 11) and NIR (band 8): identifies built-up spectral signature.
-        2. Sobel gradient on grayscale RGB: reinforces sharp man-made edges.
-        3. Combined score = NDBI_positive + gradient_weight * gradient.
-        4. Threshold at 0.5 for binary label.
-        5. Morphological closing fills rectangular building interiors.
-
-    Args:
-        all_bands: Shape (13, H, W) raw Sentinel-2 values.
-
-    Returns:
-        Binary structure label of shape (H, W), dtype float32, values in {0, 1}.
-    """
+    """Generate a per-pixel built-up / structure label from 13-band Sentinel-2 data."""
     nir  = all_bands[BAND_NIR].astype(np.float32)
     swir = all_bands[BAND_SWIR].astype(np.float32)
     ndbi = compute_ndbi(nir, swir)
 
-    # Grayscale from RGB (luminance weights)
     r = all_bands[BAND_RED].astype(np.float32)
     g = all_bands[BAND_GREEN].astype(np.float32)
     b = all_bands[BAND_BLUE].astype(np.float32)
@@ -87,19 +71,14 @@ def generate_structure_label(all_bands: np.ndarray,
 
     grad = compute_gradient_magnitude(gray)
 
-    # Positive NDBI component (normalised to [0, 1])
     ndbi_pos = np.clip(ndbi - ndbi_threshold, 0, None)
     ndbi_max = ndbi_pos.max()
     ndbi_norm = ndbi_pos / (ndbi_max + 1e-8)
 
-    # Combined score
     combined = ndbi_norm + gradient_weight * grad
     combined = combined / (combined.max() + 1e-8)
 
-    # Binary threshold
     binary = (combined > 0.5).astype(bool)
-
-    # Morphological closing to fill building footprints
     struct = np.ones((closing_size, closing_size), dtype=bool)
     binary = binary_closing(binary, structure=struct)
 
@@ -107,11 +86,7 @@ def generate_structure_label(all_bands: np.ndarray,
 
 
 def extract_rgb(all_bands: np.ndarray) -> np.ndarray:
-    """Extract and normalise RGB channels from 13-band data.
-
-    Returns:
-        Shape (3, H, W), dtype float32, range [0, 1].
-    """
+    """Extract and normalise RGB channels from 13-band data. Returns (3, H, W), float32, [0,1]."""
     rgb = np.stack([all_bands[BAND_RED],
                     all_bands[BAND_GREEN],
                     all_bands[BAND_BLUE]], axis=0).astype(np.float32)
@@ -123,14 +98,7 @@ def extract_rgb(all_bands: np.ndarray) -> np.ndarray:
 
 
 def compute_housing_score(pred: np.ndarray, threshold: float = 0.5) -> float:
-    """Fraction of pixels predicted as built-up structure.
-
-    Args:
-        pred: Shape (H, W), values in [0, 1].
-
-    Returns:
-        Float in [0, 1] — 0 = no structure, 1 = fully built-up.
-    """
+    """Fraction of pixels predicted as built-up structure."""
     return float((pred > threshold).sum()) / pred.size
 
 
@@ -159,28 +127,18 @@ def density_label(score: float) -> str:
         return "high density / industrial"
 
 
-# ── Visualisation ────────────────────────────────────────────────────────────
-
 def visualize_housing_detection(rgb: np.ndarray,
                                 label_true: np.ndarray,
                                 label_pred: np.ndarray,
                                 housing_score: float,
                                 save_path: str = None):
-    """4-panel plot: RGB | Ground Truth | Prediction | Overlay.
-
-    Args:
-        rgb:          (3, H, W) or (H, W, 3), range [0, 1]
-        label_true:   (H, W) binary ground-truth structure mask
-        label_pred:   (H, W) predicted structure probability
-        housing_score: fraction of predicted built-up pixels
-        save_path:    if given, save figure instead of showing
-    """
+    """4-panel plot: RGB | Ground Truth | Prediction | Overlay."""
     if rgb.shape[0] == 3:
         rgb = np.transpose(rgb, (1, 2, 0))
     rgb = np.clip(rgb, 0, 1)
 
     struct_cmap = mcolors.LinearSegmentedColormap.from_list(
-        "struct", ["#1a1a2e", "#e94560"]   # dark navy → red-pink
+        "struct", ["#1a1a2e", "#e94560"]
     )
 
     fig, axes = plt.subplots(1, 4, figsize=(20, 5))
@@ -197,18 +155,17 @@ def visualize_housing_detection(rgb: np.ndarray,
     axes[2].set_title(f"Prediction ({housing_score:.1%} structure)")
     axes[2].axis("off")
 
-    # Overlay: tint predicted structures red-pink on the RGB image
     overlay = rgb.copy()
     pred_binary = label_pred > 0.5
     overlay[pred_binary] = overlay[pred_binary] * 0.4 + np.array([0.9, 0.2, 0.2]) * 0.6
     axes[3].imshow(overlay)
-    axes[3].set_title(f"Structure Overlay — {density_label(housing_score)}")
+    axes[3].set_title(f"Structure Overlay -- {density_label(housing_score)}")
     axes[3].axis("off")
 
     plt.suptitle(
         f"Housing Density: {housing_score:.1%}  "
         f"({'IN range' if is_low_density_residential(housing_score) else 'OUT of range'} "
-        f"{HOUSING_DENSITY_MIN:.0%}–{HOUSING_DENSITY_MAX:.0%})",
+        f"{HOUSING_DENSITY_MIN:.0%}-{HOUSING_DENSITY_MAX:.0%})",
         fontsize=13, fontweight="bold"
     )
     plt.tight_layout()
@@ -221,16 +178,8 @@ def visualize_housing_detection(rgb: np.ndarray,
         plt.show()
 
 
-def visualize_housing_ranking(results: list, top_n: int = 10,
-                               save_path: str = None):
-    """Top-N grid: satellite RGB (top row) and predicted structure mask (bottom row).
-
-    Args:
-        results:   list of dicts with keys 'rgb', 'label_pred', 'housing_score'
-        top_n:     number of best low-density residential images to show
-        save_path: if given, save figure
-    """
-    # Sort by closeness to the target density band centre (12.5%)
+def visualize_housing_ranking(results: list, top_n: int = 10, save_path: str = None):
+    """Top-N grid: satellite RGB (top row) and predicted structure mask (bottom row)."""
     target = (HOUSING_DENSITY_MIN + HOUSING_DENSITY_MAX) / 2
     in_range = [r for r in results if is_low_density_residential(r["housing_score"])]
     in_range.sort(key=lambda r: abs(r["housing_score"] - target))
@@ -264,7 +213,7 @@ def visualize_housing_ranking(results: list, top_n: int = 10,
         axes[1, i].axis("off")
 
     plt.suptitle(
-        f"Low-Density Residential Areas ({HOUSING_DENSITY_MIN:.0%}–{HOUSING_DENSITY_MAX:.0%} built-up)",
+        f"Low-Density Residential Areas ({HOUSING_DENSITY_MIN:.0%}-{HOUSING_DENSITY_MAX:.0%} built-up)",
         fontsize=13, fontweight="bold"
     )
     plt.tight_layout()
