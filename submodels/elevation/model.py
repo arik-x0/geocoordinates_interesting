@@ -1,8 +1,9 @@
 """
-Elevation POI detection model.
+Topographic terrain beauty detection model.
 
-Task: predict cliff-near-water POI heatmaps from 6-channel satellite + DEM tiles.
-Ground truth: slope > threshold AND water proximity, convolved with Gaussian.
+Task: predict per-pixel terrain ruggedness beauty from 6-channel satellite + DEM tiles.
+Ground truth: local relief + slope variance + ridgeline curvature (SBE-grounded,
+              water-independent).
 
 Input to forward():
     feature_map: (B, 128, 64, 64) from CoreSatelliteModel.decode()
@@ -11,8 +12,11 @@ Input to forward():
 Architecture:
     ElevationPOITransUNet(BaseSubmodel) -- projects shared feature map to 64ch,
     encodes raw topo channels with a small CNN, fuses both streams, predicts
-    a Gaussian-smoothed heatmap (~0.35M params). Spatial decoding is done by
-    the shared UNet decoder in CoreSatelliteModel.
+    a Gaussian-smoothed terrain beauty heatmap (~0.35M params). Spatial decoding
+    is done by the shared UNet decoder in CoreSatelliteModel.
+
+High scores: mountain ridges, canyons, volcanic calderas, alpine passes, cirques.
+Low scores:  flat plains, uniform hillsides, featureless agricultural land.
 """
 
 import sys

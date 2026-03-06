@@ -447,23 +447,16 @@ def get_vegetation_dataloaders(
 
 
 def get_elevation_dataloaders(
-    data_dir:        Path  = DEFAULT_DATA_DIR,
-    batch_size:      int   = 16,
-    val_split:       float = 0.15,
-    test_split:      float = 0.10,
-    num_workers:     int   = 0,
-    use_real_dem:    bool  = True,
-    cliff_threshold: float = CLIFF_SLOPE_THRESHOLD,
-    water_threshold: float = NDWI_WATER_THRESHOLD,
+    data_dir:     Path  = DEFAULT_DATA_DIR,
+    batch_size:   int   = 16,
+    val_split:    float = 0.15,
+    test_split:   float = 0.10,
+    num_workers:  int   = 0,
+    use_real_dem: bool  = True,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """Return (train, val, test) loaders for the elevation POI model."""
+    """Return (train, val, test) loaders for the terrain beauty elevation model."""
     root = download_eurosat(data_dir)
-    dataset = ElevationPOIDataset(
-        root,
-        cliff_threshold=cliff_threshold,
-        water_threshold=water_threshold,
-        use_real_dem=use_real_dem,
-    )
+    dataset = ElevationPOIDataset(root, use_real_dem=use_real_dem)
 
     def collate_fn(batch):
         return (
