@@ -1,11 +1,17 @@
 """
-Elevation POI submodel -- dual RGB+topo stream decoder + Gaussian heatmap head.
+Elevation POI submodel -- topo-fusion heatmap head.
 
 Task: predict cliff-near-water POI heatmaps from 6-channel satellite + DEM tiles.
 Ground truth: slope > threshold AND water proximity, convolved with Gaussian.
 
+Input to forward():
+    feature_map: (B, 128, 64, 64) from CoreSatelliteModel.decode()
+    topo:        (B,   3, 64, 64) DEM elevation + slope + aspect (pre-normalised)
+
 Model:
-    ElevationPOITransUNet(BaseSubmodel) -- 2-stage RGB decoder fused with topo CNN.
+    ElevationPOITransUNet(BaseSubmodel) -- projects shared feature map to 64ch,
+    encodes raw topo channels with a small CNN, fuses both streams, predicts
+    a Gaussian-smoothed heatmap. Spatial decoding is done by the shared decoder.
 
 Entry points (run from project root):
     python -m submodels.elevation train   [--epochs N ...]
@@ -23,7 +29,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from .base import BaseSubmodel, _ConvBlock, _EMBED_DIM
+from .base import BaseSubmodel, _ConvBlock
+from core.model import _DEC_CHANNELS
 
 _KERNEL_SIZE = 7
 _SIGMA       = 1.5
@@ -42,63 +49,45 @@ def _gaussian_kernel(size: int, sigma: float) -> torch.Tensor:
 # ════════════════════════════════════════════════════════════════════════════
 
 class ElevationPOITransUNet(BaseSubmodel):
-    """Elevation cliff-water POI submodel (~1.5M trainable params).
+    """Elevation cliff-water POI fusion head (~0.35M trainable params).
+
+    Two input streams at 64x64:
+        RGB stream:  proj(feature_map 128ch) -> 64ch
+        Topo stream: small CNN on raw DEM+slope+aspect -> 64ch (trained from scratch)
 
     Architecture:
-        RGB stream (from core features):
-            blk11 (384ch) -> proj11 -> dec_a (128ch @ 14x14)
-            _upsample_cat with proj5(blk5) -> dec_b (64ch @ 32x32)
-            upsample -> rgb_feat (64ch @ 64x64)
-
-        Topo stream (raw DEM+slope+aspect, trained from scratch):
-            (B, 3, 64x64) -> topo_enc1 (32ch) -> topo_enc2 (64ch @ 64x64)
-
-        Fusion:
-            cat(rgb_feat, topo_feat) -> fusion ConvBlock (64ch)
-            -> head Conv(64->1) -> soft activation -> Gaussian blur -> clamp [0,1]
+        feature_map (B, 128, 64x64) -> proj Conv(128->64) -> rgb_feat (B, 64, 64x64)
+        topo        (B,   3, 64x64) -> topo_enc1(32) -> topo_enc2(64) -> topo_feat
+        cat([rgb_feat, topo_feat])   -> fusion ConvBlock(128->64)
+        -> head Conv(64->1) -> soft activation -> Gaussian blur -> clamp [0,1]
     """
 
-    def __init__(self, out_channels: int = 1):
+    def __init__(self, in_channels: int = _DEC_CHANNELS, out_channels: int = 1):
         super().__init__()
 
-        # RGB stream
-        self.proj11 = nn.Conv2d(_EMBED_DIM, 128, 1)
-        self.proj5  = nn.Conv2d(_EMBED_DIM,  64, 1)
-        self.dec_a  = _ConvBlock(128,       128)
-        self.dec_b  = _ConvBlock(128 +  64,  64)
+        # RGB stream: project shared feature map to lower dim
+        self.proj = nn.Conv2d(in_channels, 64, 1)
 
-        # Topo stream
+        # Topo stream: small CNN trained from scratch
         self.topo_enc1 = _ConvBlock(3,  32)
         self.topo_enc2 = _ConvBlock(32, 64)
 
-        # Fusion + head
+        # Fusion + heatmap head
         self.fusion = _ConvBlock(64 + 64, 64)
         self.head   = nn.Conv2d(64, out_channels, 1)
 
         self.register_buffer("_gauss", _gaussian_kernel(_KERNEL_SIZE, _SIGMA))
 
-    def forward(self, features: dict, topo: torch.Tensor) -> torch.Tensor:
-        # RGB stream: decode core features 14x14 -> 64x64
-        f11 = self.proj11(features["blk11"])            # (B, 128, 14, 14)
-        f5  = self.proj5(features["blk5"])              # (B,  64, 14, 14)
+    def forward(self, feature_map: torch.Tensor, topo: torch.Tensor) -> torch.Tensor:
+        rgb_feat  = self.proj(feature_map)                # (B, 64, 64, 64)
+        topo_feat = self.topo_enc2(self.topo_enc1(topo))  # (B, 64, 64, 64)
 
-        d = self.dec_a(f11)                                       # (B, 128, 14, 14)
-        d = self.dec_b(self._upsample_cat(d, f5, (32, 32)))      # (B,  64, 32, 32)
-        rgb_feat = F.interpolate(d, size=(64, 64),
-                                 mode="bilinear", align_corners=False)  # (B, 64, 64, 64)
-
-        # Topo stream
-        t = self.topo_enc2(self.topo_enc1(topo))        # (B,  64, 64, 64)
-
-        # Fuse and predict
-        fused  = self.fusion(torch.cat([rgb_feat, t], dim=1))   # (B, 64, 64, 64)
-        logits = self.head(fused)                                # (B,  1, 64, 64)
+        fused  = self.fusion(torch.cat([rgb_feat, topo_feat], dim=1))  # (B, 64, 64, 64)
+        logits = self.head(fused)                                       # (B,  1, 64, 64)
 
         sig  = torch.sigmoid(logits)
         pred = sig * (1.0 + 0.1 * logits)
-
-        padding = _KERNEL_SIZE // 2
-        pred = F.conv2d(pred, self._gauss, padding=padding)
+        pred = F.conv2d(pred, self._gauss, padding=_KERNEL_SIZE // 2)
         return pred.clamp(0.0, 1.0)
 
 
@@ -128,7 +117,7 @@ class HeatmapLoss(nn.Module):
 
 
 class ElevationTrainer(BaseTrainer):
-    """Trains ElevationPOITransUNet on frozen DINO features + raw topo channels."""
+    """Trains ElevationPOITransUNet head on shared decoder features + topo."""
 
     submodel_name = "ElevationPOITransUNet"
 
@@ -148,10 +137,10 @@ class ElevationTrainer(BaseTrainer):
         return HeatmapLoss(mse_weight=0.5, dice_weight=0.5)
 
     def rgb_slice(self, inputs):
-        return inputs[:, :3]   # channels 0-2: RGB
+        return inputs[:, :3]
 
     def extra_slice(self, inputs):
-        return inputs[:, 3:]   # channels 3-5: DEM, slope, aspect
+        return inputs[:, 3:]
 
     def get_encode_fn(self, core):
         return lambda x: core.encode(x[:, :3])
@@ -222,7 +211,6 @@ class ElevationPredictor(BasePredictor):
         n_water  = sum(1 for r in all_results if r["has_water"])
         n_cliffs = sum(1 for r in all_results if r["has_cliffs"])
         n_both   = sum(1 for r in all_results if r["has_water"] and r["has_cliffs"])
-
         print(f"\n{'='*80}")
         print(f"  CLIFF-WATER POI RANKING -- Top {min(top_n, n)} of {n}")
         print(f"{'='*80}")
@@ -232,11 +220,8 @@ class ElevationPredictor(BasePredictor):
             print(f"  {rank:<6} {r['poi_score']:<8.3f} {r['water_fraction']:<9.1%} "
                   f"{r['max_slope']:<10.1f} {r['class_name']:<18} {Path(r['filepath']).name}")
         print(f"{'='*80}")
-        print(f"\n  Total: {n}  |  Water: {n_water} ({n_water/n:.0%})  "
-              f"|  Cliffs: {n_cliffs} ({n_cliffs/n:.0%})  "
-              f"|  Both: {n_both} ({n_both/n:.0%})")
-        print(f"  Mean POI: {np.mean(scores):.4f}  |  Max POI: {np.max(scores):.4f}")
-
+        print(f"\n  Water: {n_water}/{n} ({n_water/n:.0%})  Cliffs: {n_cliffs}/{n}  "
+              f"Both: {n_both}/{n}  Mean POI: {np.mean(scores):.4f}")
         class_scores: dict = {}
         for r in all_results:
             class_scores.setdefault(r["class_name"], []).append(r["poi_score"])
@@ -244,18 +229,17 @@ class ElevationPredictor(BasePredictor):
         print(f"  {'-'*25} {'-'*12} {'-'*12} {'-'*10}")
         for cls in sorted(class_scores, key=lambda c: np.mean(class_scores[c]), reverse=True):
             avg = np.mean(class_scores[cls])
-            mx  = np.max(class_scores[cls])
-            print(f"  {cls:<25} {avg:<12.4f} {mx:<12.4f} {len(class_scores[cls]):<10} "
-                  f"|{'#' * int(avg * 40)}")
+            print(f"  {cls:<25} {avg:<12.4f} {np.max(class_scores[cls]):<12.4f} "
+                  f"{len(class_scores[cls]):<10} |{'#' * int(avg * 40)}")
 
     def print_similarity(self, result, rank, similar):
         print(f"\n  Rank #{rank}  {result['class_name']}  poi={result['poi_score']:.4f}"
               f"  ({Path(result['filepath']).name})")
         print(f"  {'Sim':>6}  {'Split':<6}  {'Water':<6}  {'Cliffs':<7}  {'Class':<20}  File")
         for s in similar:
-            wf = "yes" if s.get("has_water")  else "no"
-            cf = "yes" if s.get("has_cliffs") else "no"
-            print(f"  {s['similarity']:>6.4f}  {s['split']:<6}  {wf:<6}  {cf:<7}  "
+            print(f"  {s['similarity']:>6.4f}  {s['split']:<6}  "
+                  f"{'yes' if s.get('has_water') else 'no':<6}  "
+                  f"{'yes' if s.get('has_cliffs') else 'no':<7}  "
                   f"{s['class_name']:<20}  {Path(s['filepath']).name}")
 
     def save_visualizations(self, all_results, output_dir, top_n):
@@ -268,10 +252,8 @@ class ElevationPredictor(BasePredictor):
                 poi_score=r["poi_score"],
                 save_path=str(output_dir / f"poi_rank_{rank:02d}_{r['class_name']}.png"),
             )
-        visualize_poi_ranking(
-            all_results, top_n=min(10, len(all_results)),
-            save_path=str(output_dir / "poi_ranking_overview.png"),
-        )
+        visualize_poi_ranking(all_results, top_n=min(10, len(all_results)),
+                              save_path=str(output_dir / "poi_ranking_overview.png"))
         print("Ranking overview saved.")
         print(f"\nSaving bottom-5 (lowest POI) for comparison...")
         for rank, r in enumerate(all_results[-5:], 1):
@@ -289,12 +271,10 @@ class ElevationPredictor(BasePredictor):
 # ════════════════════════════════════════════════════════════════════════════
 
 def _build_parser():
-    parser = argparse.ArgumentParser(
-        description="Elevation cliff-water POI detection submodel"
-    )
+    parser = argparse.ArgumentParser(description="Elevation cliff-water POI detection submodel")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    tp = sub.add_parser("train", help="Train ElevationPOITransUNet on frozen core features")
+    tp = sub.add_parser("train", help="Train ElevationPOITransUNet head on shared decoder features")
     tp.add_argument("--data-dir",       type=str,   default="data")
     tp.add_argument("--checkpoint-dir", type=str,   default="checkpoints/elevation")
     tp.add_argument("--epochs",         type=int,   default=25)

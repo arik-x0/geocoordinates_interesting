@@ -1,34 +1,35 @@
 """
 Base training class for all POI submodel pipelines.
 
+Architecture contract:
+    core.freeze()    -- freezes ViT backbone only; decoder stays trainable
+    optimizer        -- Adam over core.decoder.parameters() + submodel.parameters()
+    forward pass:
+        with torch.no_grad():
+            features = core.extract_features(rgb)   # frozen backbone
+        feature_map = core.decode(features)          # trainable shared decoder
+        predictions = submodel(feature_map, [topo])  # task-specific head
+
+Checkpoint format:
+    {
+        "epoch":                int,
+        "decoder_state_dict":   core.decoder.state_dict(),
+        "submodel_state_dict":  submodel.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_iou":              float,  (best checkpoint only)
+        "val_dice":             float,
+        "val_loss":             float,
+    }
+
 Subclasses override:
-    get_dataloaders()     -> (train_loader, val_loader, test_loader)
-    build_submodel()      -> nn.Module
-    build_criterion()     -> nn.Module (loss function)
-    rgb_slice()           -> slice RGB from a batch  (default: full input)
-    extra_slice()         -> extra tensor for submodel (default: None)
-    get_encode_fn()       -> callable for FAISS index (default: core.encode)
-    submodel_name         -> str shown in the training header
-    add_args()            -> classmethod to register task-specific CLI flags
-
-Usage example (submodels/vegetation.py):
-
-    class VegetationTrainer(BaseTrainer):
-        submodel_name = "TransUNet"
-
-        def get_dataloaders(self):
-            return get_vegetation_dataloaders(
-                data_dir=Path(self.args.data_dir),
-                batch_size=self.args.batch_size,
-                num_workers=self.args.num_workers,
-                ndvi_threshold=self.args.ndvi_threshold,
-            )
-
-        def build_submodel(self):
-            return TransUNet(out_channels=1)
-
-        def build_criterion(self):
-            return DiceBCELoss(dice_weight=0.5)
+    get_dataloaders()  -> (train_loader, val_loader, test_loader)
+    build_submodel()   -> nn.Module  (task head only)
+    build_criterion()  -> nn.Module
+    rgb_slice()        -> extract RGB from batch          (default: full input)
+    extra_slice()      -> extra tensor for submodel head  (default: None)
+    get_encode_fn()    -> callable for FAISS              (default: core.encode)
+    submodel_name      -> str shown in the training header
+    add_args()         -> classmethod to register task-specific CLI flags
 """
 
 import json
@@ -51,9 +52,11 @@ from submodels.base import count_parameters  # noqa: E402
 class BaseTrainer:
     """Shared training orchestration for all POI submodels.
 
-    The frozen CoreSatelliteModel provides multi-scale features; the submodel
-    trains on those features.  Checkpoints, epoch logs, and a FAISS VectorDB
-    index are written to `args.checkpoint_dir`.
+    The frozen ViT backbone provides raw token maps; the trainable shared
+    UNet decoder (inside CoreSatelliteModel) produces a 64x64 feature map;
+    the task submodel head produces the final prediction.
+
+    Both the decoder and the submodel head are optimised together.
     """
 
     submodel_name: str = "Submodel"
@@ -68,7 +71,7 @@ class BaseTrainer:
         raise NotImplementedError
 
     def build_submodel(self) -> torch.nn.Module:
-        """Instantiate and return the task submodel (not yet on device)."""
+        """Instantiate and return the task head (not yet on device)."""
         raise NotImplementedError
 
     def build_criterion(self) -> torch.nn.Module:
@@ -78,33 +81,23 @@ class BaseTrainer:
     # ── Optional overrides ──────────────────────────────────────────────────
 
     def rgb_slice(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Extract the RGB channels from a batch tensor.
-
-        Default: returns inputs unchanged (suitable when the dataloader only
-        yields 3-channel RGB tiles).  Override for multi-channel tasks:
-
-            def rgb_slice(self, inputs):
-                return inputs[:, :3]   # elevation: 6-channel → RGB
-        """
+        """Return the RGB channels from a batch tensor (default: full input)."""
         return inputs
 
     def extra_slice(self, inputs: torch.Tensor):
-        """Return an extra tensor to pass to submodel.forward() beyond features.
+        """Return extra tensor passed to submodel.forward() (default: None).
 
-        Default: None (submodel is called as submodel(features)).
         Override for multi-stream tasks:
-
             def extra_slice(self, inputs):
                 return inputs[:, 3:]   # elevation: DEM+slope+aspect channels
         """
         return None
 
     def get_encode_fn(self, core):
-        """Return a callable that encodes a batch to L2-normalised embeddings.
+        """Return a callable batch -> L2-normalised embedding for FAISS.
 
-        Default: core.encode.  Override when the dataloader yields multi-channel
-        batches but core.encode expects only RGB:
-
+        Default: core.encode (expects RGB input).
+        Override if the dataloader yields multi-channel batches:
             def get_encode_fn(self, core):
                 return lambda x: core.encode(x[:, :3])
         """
@@ -112,21 +105,12 @@ class BaseTrainer:
 
     @classmethod
     def add_args(cls, parser):
-        """Add task-specific CLI arguments.  Override as needed."""
-
-    # ── Forward helpers ─────────────────────────────────────────────────────
-
-    def _forward(self, core, submodel, inputs):
-        """Run core (frozen) then submodel.  Returns predictions."""
-        features = core.extract_features(self.rgb_slice(inputs))
-        extra    = self.extra_slice(inputs)
-        if extra is not None:
-            return submodel(features, extra)
-        return submodel(features)
+        """Register task-specific CLI arguments. Override as needed."""
 
     # ── Training loop ───────────────────────────────────────────────────────
 
     def _train_one_epoch(self, core, submodel, loader, criterion, optimizer, device):
+        core.decoder.train()
         submodel.train()
         total_loss = total_iou = total_dice = 0.0
         n_batches  = 0
@@ -135,16 +119,23 @@ class BaseTrainer:
             inputs  = inputs.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
+
+            # Backbone frozen: run under no_grad to skip building its graph
             with torch.no_grad():
                 features = core.extract_features(self.rgb_slice(inputs))
+
+            # Decoder + head: both trainable, gradients flow normally
+            feature_map = core.decode(features)
             extra = self.extra_slice(inputs)
             if extra is not None:
-                predictions = submodel(features, extra)
+                predictions = submodel(feature_map, extra)
             else:
-                predictions = submodel(features)
+                predictions = submodel(feature_map)
+
             loss = criterion(predictions, targets)
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
             total_iou  += compute_iou(predictions.detach(), targets)
             total_dice += compute_dice(predictions.detach(), targets)
@@ -154,18 +145,20 @@ class BaseTrainer:
 
     @torch.no_grad()
     def _validate(self, core, submodel, loader, criterion, device):
+        core.decoder.eval()
         submodel.eval()
         total_loss = total_iou = total_dice = 0.0
         n_batches  = 0
         for inputs, targets, _meta in tqdm(loader, desc="  Val  ", leave=False):
             inputs  = inputs.to(device)
             targets = targets.to(device)
-            features = core.extract_features(self.rgb_slice(inputs))
-            extra    = self.extra_slice(inputs)
+            features    = core.extract_features(self.rgb_slice(inputs))
+            feature_map = core.decode(features)
+            extra = self.extra_slice(inputs)
             if extra is not None:
-                predictions = submodel(features, extra)
+                predictions = submodel(feature_map, extra)
             else:
-                predictions = submodel(features)
+                predictions = submodel(feature_map)
             loss = criterion(predictions, targets)
             total_loss += loss.item()
             total_iou  += compute_iou(predictions, targets)
@@ -183,15 +176,22 @@ class BaseTrainer:
         print("\n--- Loading Dataset ---")
         train_loader, val_loader, test_loader = self.get_dataloaders()
 
-        print("\n--- Loading Core Model (DINO ViT-S/16, frozen) ---")
+        print("\n--- Loading Core Model (DINO ViT-S/16 backbone, frozen) ---")
         core = CoreSatelliteModel().freeze().to(device)
-        print(f"  Core params (frozen): {sum(p.numel() for p in core.parameters()):,}")
+        backbone_params = sum(p.numel() for p in core.backbone.parameters())
+        decoder_params  = sum(p.numel() for p in core.decoder.parameters())
+        print(f"  Backbone (frozen):           {backbone_params:,}")
+        print(f"  Shared decoder (trainable):  {decoder_params:,}")
 
         submodel  = self.build_submodel().to(device)
         criterion = self.build_criterion()
-        print(f"  {self.submodel_name} (trainable): {count_parameters(submodel):,} params")
+        print(f"  {self.submodel_name} head (trainable): {count_parameters(submodel):,} params")
 
-        optimizer = Adam(submodel.parameters(), lr=args.lr, weight_decay=1e-4)
+        # Decoder and submodel head are optimised jointly
+        optimizer = Adam(
+            list(core.decoder.parameters()) + list(submodel.parameters()),
+            lr=args.lr, weight_decay=1e-4,
+        )
         scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.5,
                                       verbose=True)
 
@@ -230,6 +230,7 @@ class BaseTrainer:
                 best_val_iou = val_iou
                 torch.save({
                     "epoch":                epoch,
+                    "decoder_state_dict":   core.decoder.state_dict(),
                     "submodel_state_dict":  submodel.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_iou":              val_iou,
@@ -261,6 +262,7 @@ class BaseTrainer:
 
         torch.save({
             "epoch":                args.epochs,
+            "decoder_state_dict":   core.decoder.state_dict(),
             "submodel_state_dict":  submodel.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         }, checkpoint_dir / "final_model.pth")

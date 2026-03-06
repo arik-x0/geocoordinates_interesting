@@ -1,11 +1,15 @@
 """
-Housing POI submodel -- 3-stage U-Net decoder + multi-scale HED-style fusion.
+Housing POI submodel -- two-scale HED-style detection head.
 
 Task: detect per-pixel built-up structure probability from RGB satellite tiles.
 Ground truth: NDBI-derived binary mask.
 
+Input to forward():
+    feature_map: (B, 128, 64, 64) from CoreSatelliteModel.decode()
+
 Model:
-    HousingEdgeCNN(BaseSubmodel) -- multi-scale side outputs + HED fusion.
+    HousingEdgeCNN(BaseSubmodel) -- direct side output + depthwise edge-sharpened
+    side output fused via a 1x1 conv. Thin head; spatial decoding is shared.
 
 Entry points (run from project root):
     python -m submodels.housing train   [--epochs N ...]
@@ -19,11 +23,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from .base import BaseSubmodel, _ConvBlock, _EMBED_DIM
+from .base import BaseSubmodel
+from core.model import _DEC_CHANNELS
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -31,56 +35,34 @@ from .base import BaseSubmodel, _ConvBlock, _EMBED_DIM
 # ════════════════════════════════════════════════════════════════════════════
 
 class HousingEdgeCNN(BaseSubmodel):
-    """Housing structure submodel (~2.2M trainable params).
+    """Housing structure detection head (~0.07M trainable params).
+
+    Produces two complementary predictions from the shared feature map and
+    fuses them: a direct spatial side output and an edge-sharpened side output.
 
     Architecture:
-        blk11 (B, 384, 14x14)  deepest ViT features
-          proj11 -> dec_a (256ch @ 14x14) -> side_16 -> upsample 64x64
-          _upsample_cat with proj8(blk8) -> dec_b (128ch @ 32x32) -> side_32 -> upsample 64x64
-          _upsample_cat with proj2(blk2) -> dec_c (64ch @ 64x64)
-          depthwise edge_conv -> side_64
-          fusion Conv(3->1) + Sigmoid
+        feature_map (B, 128, 64x64)
+          -> side_main: Conv(128 -> 1)           -- global structure signal
+          -> edge_conv: depthwise(128) + side_edge: Conv(128 -> 1)  -- edge signal
+          -> fusion: Conv(2 -> 1) + Sigmoid
     """
 
-    def __init__(self, out_channels: int = 1):
+    def __init__(self, in_channels: int = _DEC_CHANNELS, out_channels: int = 1):
         super().__init__()
-
-        self.proj11 = nn.Conv2d(_EMBED_DIM, 256, 1)
-        self.proj8  = nn.Conv2d(_EMBED_DIM, 128, 1)
-        self.proj2  = nn.Conv2d(_EMBED_DIM,  64, 1)
-
-        self.dec_a = _ConvBlock(256,       256)
-        self.dec_b = _ConvBlock(256 + 128, 128)
-        self.dec_c = _ConvBlock(128 +  64,  64)
-
-        self.side_16 = nn.Conv2d(256, 1, 1)
-        self.side_32 = nn.Conv2d(128, 1, 1)
+        self.side_main = nn.Conv2d(in_channels, 1, 1)
 
         self.edge_conv = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False),
+            nn.BatchNorm2d(in_channels),
             nn.ReLU(inplace=True),
         )
-        self.side_64 = nn.Conv2d(64, 1, 1)
-        self.fusion  = nn.Conv2d(3, out_channels, 1)
+        self.side_edge = nn.Conv2d(in_channels, 1, 1)
+        self.fusion    = nn.Conv2d(2, out_channels, 1)
 
-    def forward(self, features: dict) -> torch.Tensor:
-        f11 = self.proj11(features["blk11"])   # (B, 256, 14, 14)
-        f8  = self.proj8(features["blk8"])     # (B, 128, 14, 14)
-        f2  = self.proj2(features["blk2"])     # (B,  64, 14, 14)
-
-        d   = self.dec_a(f11)                                    # (B, 256, 14, 14)
-        s16 = F.interpolate(self.side_16(d), size=(64, 64),
-                            mode="bilinear", align_corners=False)
-
-        d   = self.dec_b(self._upsample_cat(d, f8, (32, 32)))   # (B, 128, 32, 32)
-        s32 = F.interpolate(self.side_32(d), size=(64, 64),
-                            mode="bilinear", align_corners=False)
-
-        d   = self.dec_c(self._upsample_cat(d, f2, (64, 64)))   # (B,  64, 64, 64)
-        s64 = self.side_64(self.edge_conv(d))                    # (B,   1, 64, 64)
-
-        return torch.sigmoid(self.fusion(torch.cat([s16, s32, s64], dim=1)))
+    def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
+        s_main = self.side_main(feature_map)               # (B, 1, 64, 64)
+        s_edge = self.side_edge(self.edge_conv(feature_map))  # (B, 1, 64, 64)
+        return torch.sigmoid(self.fusion(torch.cat([s_main, s_edge], dim=1)))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -93,7 +75,7 @@ from dataset import get_housing_dataloaders
 
 
 class HousingTrainer(BaseTrainer):
-    """Trains HousingEdgeCNN on frozen DINO core features for structure detection."""
+    """Trains HousingEdgeCNN head on shared decoder feature maps."""
 
     submodel_name = "HousingEdgeCNN"
 
@@ -168,13 +150,12 @@ class HousingPredictor(BasePredictor):
 
         print(f"\n{'='*80}")
         print(f"  HOUSING DENSITY ANALYSIS -- {n} test images")
-        print(f"  Target zone: {HOUSING_DENSITY_MIN:.0%} - {HOUSING_DENSITY_MAX:.0%} built-up coverage")
+        print(f"  Target zone: {HOUSING_DENSITY_MIN:.0%} - {HOUSING_DENSITY_MAX:.0%} built-up")
         print(f"{'='*80}")
         print(f"  Low-density residential: {len(low_density):>5}  ({len(low_density)/n:.0%})")
         print(f"  Undeveloped / rural:     {len(undeveloped):>5}  ({len(undeveloped)/n:.0%})")
         print(f"  Dense / industrial:      {len(high_density):>5}  ({len(high_density)/n:.0%})")
         print(f"{'='*80}")
-
         print(f"\n  --- Top low-density residential ({min(top_n, len(low_density))} shown) ---")
         print(f"  {'Rank':<6} {'Score':<9} {'NDBI':<8} {'Residential?':<14} {'Class':<18} File")
         print(f"  {'-'*6} {'-'*9} {'-'*8} {'-'*14} {'-'*18} {'-'*25}")
@@ -189,7 +170,7 @@ class HousingPredictor(BasePredictor):
         print(f"\n  {'Class':<25} {'Avg Density':<14} {'In Range%':<12} {'Count'}")
         print(f"  {'-'*25} {'-'*14} {'-'*12} {'-'*10}")
         for cls in sorted(class_scores, key=lambda c: np.mean(class_scores[c]), reverse=True):
-            scores = class_scores[cls]
+            scores   = class_scores[cls]
             avg      = np.mean(scores)
             in_range = sum(1 for s in scores if is_low_density_residential(s)) / len(scores)
             print(f"  {cls:<25} {avg:<14.1%} {in_range:<12.0%} {len(scores):<10} "
@@ -215,7 +196,6 @@ class HousingPredictor(BasePredictor):
             save_path=str(output_dir / "housing_ranking_overview.png"),
         )
         print("Ranking overview saved.")
-
         print(f"\nSaving bottom-5 (densest) for comparison...")
         for rank, r in enumerate(
                 sorted(all_results, key=lambda r: r["housing_score"], reverse=True)[:5], 1):
@@ -231,12 +211,10 @@ class HousingPredictor(BasePredictor):
 # ════════════════════════════════════════════════════════════════════════════
 
 def _build_parser():
-    parser = argparse.ArgumentParser(
-        description="Housing structure detection submodel"
-    )
+    parser = argparse.ArgumentParser(description="Housing structure detection submodel")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    tp = sub.add_parser("train", help="Train HousingEdgeCNN on frozen core features")
+    tp = sub.add_parser("train", help="Train HousingEdgeCNN head on shared decoder features")
     tp.add_argument("--data-dir",       type=str,   default="data")
     tp.add_argument("--checkpoint-dir", type=str,   default="checkpoints/housing")
     tp.add_argument("--epochs",         type=int,   default=25)

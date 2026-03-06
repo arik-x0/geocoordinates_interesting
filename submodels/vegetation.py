@@ -1,11 +1,16 @@
 """
-Vegetation POI submodel — lightweight 3-stage U-Net decoder + SE head.
+Vegetation POI submodel -- SE channel-attention head.
 
 Task: segment per-pixel vegetation/greenery from RGB satellite tiles.
 Ground truth: NDVI > threshold binary mask.
 
+Input to forward():
+    feature_map: (B, 128, 64, 64) from CoreSatelliteModel.decode()
+
 Model:
-    TransUNet(BaseSubmodel) — 3-stage decoder with channel-attention head.
+    TransUNet(BaseSubmodel) -- ConvBlock(128->64) + SE attention + Conv(64->1) head.
+    The heavy spatial decoding (ViT tokens -> 64x64) is done by the shared
+    UNet decoder inside CoreSatelliteModel, so this head stays thin.
 
 Entry points (run from project root):
     python -m submodels.vegetation train   [--epochs N ...]
@@ -22,7 +27,8 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from .base import BaseSubmodel, _ConvBlock, _EMBED_DIM
+from .base import BaseSubmodel, _ConvBlock
+from core.model import _DEC_CHANNELS
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -30,27 +36,21 @@ from .base import BaseSubmodel, _ConvBlock, _EMBED_DIM
 # ════════════════════════════════════════════════════════════════════════════
 
 class TransUNet(BaseSubmodel):
-    """Vegetation greenery submodel (~2.5M trainable params).
+    """Vegetation greenery head (~0.2M trainable params).
+
+    Receives the shared 64x64 feature map from the core decoder and applies
+    channel-attention re-weighting before the binary segmentation output.
 
     Architecture:
-        blk11 (B, 384, 14×14)  deepest ViT features
-          proj11 -> dec_a (256ch @ 14×14)
-          _upsample_cat with proj5(blk5) -> dec_b (128ch @ 32×32)
-          _upsample_cat with proj2(blk2) -> dec_c (64ch @ 64×64)
-          SE channel-attention -> head Conv(64->1) + Sigmoid
+        feature_map (B, 128, 64x64)
+          -> reduce ConvBlock(128 -> 64)
+          -> SE channel-attention (64 -> 16 -> 64 -> sigmoid weights)
+          -> head Conv(64 -> 1) + Sigmoid
     """
 
-    def __init__(self, out_channels: int = 1):
+    def __init__(self, in_channels: int = _DEC_CHANNELS, out_channels: int = 1):
         super().__init__()
-
-        self.proj11 = nn.Conv2d(_EMBED_DIM, 256, 1)
-        self.proj5  = nn.Conv2d(_EMBED_DIM, 128, 1)
-        self.proj2  = nn.Conv2d(_EMBED_DIM,  64, 1)
-
-        self.dec_a = _ConvBlock(256,       256)
-        self.dec_b = _ConvBlock(256 + 128, 128)
-        self.dec_c = _ConvBlock(128 +  64,  64)
-
+        self.reduce = _ConvBlock(in_channels, 64)
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -61,17 +61,10 @@ class TransUNet(BaseSubmodel):
         )
         self.head = nn.Conv2d(64, out_channels, 1)
 
-    def forward(self, features: dict) -> torch.Tensor:
-        f11 = self.proj11(features["blk11"])   # (B, 256, 14, 14)
-        f5  = self.proj5(features["blk5"])     # (B, 128, 14, 14)
-        f2  = self.proj2(features["blk2"])     # (B,  64, 14, 14)
-
-        d = self.dec_a(f11)                                      # (B, 256, 14, 14)
-        d = self.dec_b(self._upsample_cat(d, f5, (32, 32)))     # (B, 128, 32, 32)
-        d = self.dec_c(self._upsample_cat(d, f2, (64, 64)))     # (B,  64, 64, 64)
-
-        weights = self.se(d).unsqueeze(-1).unsqueeze(-1)         # (B, 64, 1, 1)
-        return torch.sigmoid(self.head(d * weights))             # (B, 1, 64, 64)
+    def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
+        x = self.reduce(feature_map)                        # (B, 64, 64, 64)
+        w = self.se(x).unsqueeze(-1).unsqueeze(-1)          # (B, 64, 1, 1)
+        return torch.sigmoid(self.head(x * w))              # (B, 1, 64, 64)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -84,7 +77,7 @@ from dataset import get_vegetation_dataloaders
 
 
 class VegetationTrainer(BaseTrainer):
-    """Trains TransUNet on frozen DINO core features for vegetation segmentation."""
+    """Trains TransUNet head on shared decoder feature maps."""
 
     submodel_name = "TransUNet"
 
@@ -161,11 +154,9 @@ class VegetationPredictor(BasePredictor):
             print(f"  {rank:<6} {r['greenery_score']:<10.1%} "
                   f"{r['class_name']:<20} {Path(r['filepath']).name}")
         print(f"{'='*70}")
-        print(f"\n  Mean greenery: {np.mean(scores):.1%}  "
-              f"Median: {np.median(scores):.1%}  "
+        print(f"\n  Mean: {np.mean(scores):.1%}  Median: {np.median(scores):.1%}  "
               f">50%: {sum(s > 0.5 for s in scores)}/{n}  "
               f"<10%: {sum(s < 0.1 for s in scores)}/{n}")
-
         class_scores: dict = {}
         for r in all_results:
             class_scores.setdefault(r["class_name"], []).append(r["greenery_score"])
@@ -187,7 +178,7 @@ class VegetationPredictor(BasePredictor):
             )
         viz_rank(all_results, top_n=min(10, len(all_results)),
                  save_path=str(output_dir / "greenery_ranking_overview.png"))
-        print(f"Ranking overview saved.")
+        print("Ranking overview saved.")
         print(f"\nSaving bottom-5 desert-dominant images...")
         for rank, r in enumerate(all_results[-5:], 1):
             visualize_prediction(
@@ -202,13 +193,10 @@ class VegetationPredictor(BasePredictor):
 # ════════════════════════════════════════════════════════════════════════════
 
 def _build_parser():
-    parser = argparse.ArgumentParser(
-        description="Vegetation greenery segmentation submodel"
-    )
+    parser = argparse.ArgumentParser(description="Vegetation greenery segmentation submodel")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ── train ──
-    tp = sub.add_parser("train", help="Train TransUNet on frozen core features")
+    tp = sub.add_parser("train", help="Train TransUNet head on shared decoder features")
     tp.add_argument("--data-dir",       type=str,   default="data")
     tp.add_argument("--checkpoint-dir", type=str,   default="checkpoints/vegetation")
     tp.add_argument("--epochs",         type=int,   default=25)
@@ -217,7 +205,6 @@ def _build_parser():
     tp.add_argument("--num-workers",    type=int,   default=0)
     VegetationTrainer.add_args(tp)
 
-    # ── predict ──
     pp = sub.add_parser("predict", help="Run inference and rank by greenery score")
     pp.add_argument("--checkpoint",    type=str, default="checkpoints/vegetation/best_model.pth")
     pp.add_argument("--data-dir",      type=str, default="data")

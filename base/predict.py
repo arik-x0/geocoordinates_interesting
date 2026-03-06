@@ -1,41 +1,23 @@
 """
 Base inference class for all POI submodel pipelines.
 
+Forward pass mirrors training:
+    features    = core.extract_features(rgb)   # frozen backbone
+    feature_map = core.decode(features)         # trained shared decoder
+    preds       = submodel(feature_map, [topo]) # task head
+
+The decoder state is loaded from the checkpoint alongside the submodel.
+
 Subclasses override:
-    get_dataloaders()    -> (_, _, test_loader)
-    build_submodel()     -> nn.Module
-    score_key            -> str  (result dict key used for sorting)
-    rgb_slice()          -> extract RGB from batch  (default: full input)
-    extra_slice()        -> extra tensor for submodel (default: None)
-    build_result()       -> build per-sample result dict
+    get_test_loader()    -> DataLoader
+    build_submodel()     -> nn.Module  (task head)
+    score_key            -> str  (result dict key used for ranking)
+    rgb_slice()          -> extract RGB from batch         (default: full input)
+    extra_slice()        -> extra tensor for submodel head (default: None)
+    build_result()       -> per-sample result dict
     print_ranking()      -> display ranked table
     save_visualizations()-> write output PNGs
-
-Usage example (submodels/vegetation.py):
-
-    class VegetationPredictor(BasePredictor):
-        score_key = "greenery_score"
-
-        def get_dataloaders(self, args):
-            _, _, test_loader = get_vegetation_dataloaders(...)
-            return test_loader
-
-        def build_submodel(self):
-            return TransUNet(out_channels=1)
-
-        def build_result(self, i, inputs_cpu, targets_cpu, preds_cpu, metas, embs_cpu):
-            return {
-                "rgb":            inputs_cpu[i],
-                "mask_true":      targets_cpu[i, 0],
-                "mask_pred":      preds_cpu[i, 0],
-                "greenery_score": greenery_score_from_prediction(preds_cpu[i]),
-                "class_name":     metas[i]["class_name"],
-                "filepath":       metas[i]["filepath"],
-                "embedding":      embs_cpu[i],
-            }
-
-        def print_ranking(self, all_results, top_n): ...
-        def save_visualizations(self, all_results, output_dir, top_n): ...
+    print_similarity()   -> VectorDB neighbour display     (default: generic)
 """
 
 import sys
@@ -48,7 +30,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.model import CoreSatelliteModel  # noqa: E402
-from base.utils import load_index, query_similar  # noqa: E402
+from base.utils import VectorDB  # noqa: E402
 
 
 class BasePredictor:
@@ -66,15 +48,15 @@ class BasePredictor:
         raise NotImplementedError
 
     def build_submodel(self) -> torch.nn.Module:
-        """Instantiate and return the task submodel (not yet on device)."""
+        """Instantiate and return the task head (not yet on device)."""
         raise NotImplementedError
 
     def build_result(self, i, inputs_cpu, targets_cpu, preds_cpu, metas, embs_cpu) -> dict:
         """Build the per-sample result dict for sample index i.
 
         Must include at least:
-            self.score_key  — float used for ranking
-            "embedding"     — (D,) numpy array for VectorDB search
+            self.score_key  -- float used for ranking
+            "embedding"     -- (D,) numpy array for VectorDB search
         """
         raise NotImplementedError
 
@@ -97,7 +79,7 @@ class BasePredictor:
         return None
 
     def print_similarity(self, result: dict, rank: int, similar: list):
-        """Print VectorDB results for one query.  Override for task-specific columns."""
+        """Print VectorDB neighbours for one query. Override for task columns."""
         print(f"\n  Rank #{rank}  {result['class_name']}  "
               f"score={result[self.score_key]:.4f}  "
               f"({Path(result['filepath']).name})")
@@ -111,8 +93,10 @@ class BasePredictor:
     @torch.no_grad()
     def run_inference(self, core, submodel, test_loader, device,
                       output_dir: Path, top_n: int,
-                      index=None, index_meta=None, top_k_similar: int = 5):
-        """Run full inference: forward pass, ranking, VectorDB, visualizations."""
+                      vdb: "VectorDB | None" = None,
+                      top_k_similar: int = 5):
+        """Run full inference: forward pass, ranking, VectorDB search, visualizations."""
+        core.decoder.eval()
         submodel.eval()
         output_dir.mkdir(parents=True, exist_ok=True)
         all_results = []
@@ -121,14 +105,14 @@ class BasePredictor:
         for inputs, targets, metas in tqdm(test_loader, desc="Inference"):
             inputs = inputs.to(device)
 
-            rgb_in = self.rgb_slice(inputs)
-            features = core.extract_features(rgb_in)
+            features    = core.extract_features(self.rgb_slice(inputs))
+            feature_map = core.decode(features)
 
             extra = self.extra_slice(inputs)
             if extra is not None:
-                preds = submodel(features, extra)
+                preds = submodel(feature_map, extra)
             else:
-                preds = submodel(features)
+                preds = submodel(feature_map)
 
             embs = F.normalize(features["cls"], p=2, dim=1)
 
@@ -146,12 +130,12 @@ class BasePredictor:
 
         self.print_ranking(all_results, top_n)
 
-        if index is not None and index_meta is not None:
+        if vdb is not None:
             show_n = min(5, len(all_results))
             print(f"\n  --- VectorDB: top-{top_k_similar} similar training images "
                   f"for top-{show_n} results ---")
             for rank, r in enumerate(all_results[:show_n], 1):
-                similar = query_similar(r["embedding"], index, index_meta, top_k_similar)
+                similar = vdb.query(r["embedding"], top_k=top_k_similar)
                 self.print_similarity(r, rank, similar)
 
         self.save_visualizations(all_results, output_dir, top_n)
@@ -165,7 +149,9 @@ class BasePredictor:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
-        core     = CoreSatelliteModel().freeze().to(device)
+        # Load core (backbone frozen, decoder loaded from checkpoint)
+        core = CoreSatelliteModel().freeze().to(device)
+
         submodel = self.build_submodel().to(device)
 
         checkpoint_path = Path(args.checkpoint)
@@ -175,13 +161,23 @@ class BasePredictor:
             return
 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+        # Load shared decoder state (trained jointly with the submodel)
+        if "decoder_state_dict" in ckpt:
+            core.decoder.load_state_dict(ckpt["decoder_state_dict"])
+            print(f"Loaded shared decoder from checkpoint.")
+        else:
+            print("WARNING: checkpoint has no decoder_state_dict — "
+                  "using randomly initialised decoder.")
+
         submodel.load_state_dict(ckpt["submodel_state_dict"])
         print(f"Loaded submodel from {checkpoint_path}")
         if "val_iou" in ckpt:
-            print(f"  Checkpoint val_iou={ckpt['val_iou']:.4f} (epoch {ckpt['epoch']})")
+            print(f"  val_iou={ckpt['val_iou']:.4f} (epoch {ckpt['epoch']})")
 
+        # VectorDB (optional — built at the end of training)
         checkpoint_dir = checkpoint_path.parent
-        index, index_meta = load_index(checkpoint_dir)
+        vdb = VectorDB.load(checkpoint_dir)
 
         test_loader = self.get_test_loader()
 
@@ -192,7 +188,6 @@ class BasePredictor:
             device=device,
             output_dir=Path(args.output_dir),
             top_n=args.top_n,
-            index=index,
-            index_meta=index_meta,
+            vdb=vdb,
             top_k_similar=args.top_k_similar,
         )
