@@ -9,6 +9,4 @@ from .symmetry      import SymmetryOrderNet,     SymmetryTrainer,      SymmetryP
 from .sublime       import ScaleSublimeNet,      SublimeTrainer,       SublimePredictor
 from .complexity    import ComplexityBalanceNet,  ComplexityTrainer,    ComplexityPredictor
 
-from .meta import AestheticAggregator, AestheticPredictor
-
 from base.submodel import count_parameters

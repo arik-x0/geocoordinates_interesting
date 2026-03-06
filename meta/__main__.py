@@ -1,4 +1,4 @@
-"""CLI: python -m submodels.meta predict"""
+"""CLI: python -m meta predict"""
 import argparse
 from .predictor import AestheticPredictor
 

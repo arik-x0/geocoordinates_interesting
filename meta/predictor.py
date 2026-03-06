@@ -2,7 +2,7 @@
 AestheticPredictor: runs all 6 aesthetic submodels + aggregator in one pipeline.
 
 Usage:
-    python -m submodels.meta predict \\
+    python -m meta predict \\
         --data-dir data \\
         --checkpoint-dir checkpoints \\
         --output-dir output/aesthetic \\
@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.model import CoreSatelliteModel                       # noqa: E402
 from dataset import get_fractal_dataloaders                    # noqa: E402
 
