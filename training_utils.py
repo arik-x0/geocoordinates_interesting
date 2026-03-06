@@ -145,15 +145,18 @@ def augment_batch(x: torch.Tensor) -> torch.Tensor:
 # ── FAISS index builder ───────────────────────────────────────────────────────
 
 @torch.no_grad()
-def build_embedding_index(model, loaders, device, checkpoint_dir: Path):
+def build_embedding_index(encode_fn, loaders, device, checkpoint_dir: Path):
     """Extract embeddings from all splits and build a FAISS IndexFlatIP.
 
-    Works with any model that implements encode(x) -> (B, D), where the
-    returned vectors are L2-normalised. Inner product on L2-normalised vectors
-    equals cosine similarity, so the index supports nearest-neighbour retrieval.
+    encode_fn must accept a batch tensor (B, C, H, W) on `device` and return
+    (B, D) L2-normalised float32 embeddings.  Pass CoreSatelliteModel.encode
+    directly, or a lambda that slices channels first (e.g. for the elevation
+    model whose dataloader yields 6-channel batches but core.encode expects 3):
 
-    All metadata fields provided by the dataset's __getitem__ are stored in the
-    JSON sidecar, making the index portable across all three model types.
+        build_embedding_index(lambda x: core.encode(x[:, :3]), loaders, ...)
+
+    Inner product on L2-normalised vectors equals cosine similarity, so the
+    resulting IndexFlatIP supports exact nearest-neighbour retrieval.
 
     Saved files:
         <checkpoint_dir>/embedding_index.faiss  — FAISS index (exact cosine sim)
@@ -171,7 +174,6 @@ def build_embedding_index(model, loaders, device, checkpoint_dir: Path):
 
     from tqdm import tqdm
 
-    model.eval()
     all_embeddings: List[np.ndarray] = []
     all_meta: List[dict] = []
 
@@ -179,7 +181,7 @@ def build_embedding_index(model, loaders, device, checkpoint_dir: Path):
     for split_name, loader in zip(["train", "val", "test"], loaders):
         for inputs, _targets, metas in tqdm(loader, desc=f"  Encoding {split_name}"):
             inputs = inputs.to(device)
-            emb = model.encode(inputs).cpu().numpy()   # (B, D) L2-normalised
+            emb = encode_fn(inputs).cpu().numpy()   # (B, D) L2-normalised
             for i in range(len(emb)):
                 all_embeddings.append(emb[i])
                 # Store split name plus all metadata keys from the dataset

@@ -3,13 +3,16 @@ Utility functions for satellite greenery analysis.
 NDVI computation, greenery scoring, and visualization helpers.
 """
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import torch
-from pathlib import Path
 
-from constants import (
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from constants import (  # noqa: E402
     BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR,
     NDVI_GREENERY_THRESHOLD, GREENERY_THRESHOLD,
 )
@@ -24,7 +27,6 @@ def compute_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
     red = red.astype(np.float32)
     nir = nir.astype(np.float32)
     denominator = nir + red
-    # Avoid division by zero
     ndvi = np.where(denominator > 0, (nir - red) / denominator, 0.0)
     return ndvi.astype(np.float32)
 
@@ -82,15 +84,7 @@ def extract_rgb(all_bands: np.ndarray) -> np.ndarray:
 
 def visualize_prediction(rgb: np.ndarray, mask_true: np.ndarray, mask_pred: np.ndarray,
                          greenery_score: float, save_path: str = None):
-    """Plot RGB image, ground truth mask, predicted mask, and overlay side by side.
-
-    Args:
-        rgb: Shape (3, H, W) or (H, W, 3), range [0, 1]
-        mask_true: Shape (H, W), binary ground truth
-        mask_pred: Shape (H, W), predicted probability or binary mask
-        greenery_score: Float, greenery ratio for this image
-        save_path: If provided, save the figure to this path
-    """
+    """Plot RGB image, ground truth mask, predicted mask, and overlay side by side."""
     if rgb.shape[0] == 3:
         rgb = np.transpose(rgb, (1, 2, 0))
 
@@ -109,7 +103,6 @@ def visualize_prediction(rgb: np.ndarray, mask_true: np.ndarray, mask_pred: np.n
     axes[2].set_title(f"Prediction (green: {greenery_score:.1%})")
     axes[2].axis("off")
 
-    # Overlay: green tint on greenery regions
     overlay = rgb.copy()
     pred_binary = (mask_pred > 0.5) if mask_pred.max() <= 1.0 else (mask_pred > 128)
     overlay[pred_binary] = overlay[pred_binary] * 0.5 + np.array([0.0, 0.7, 0.0]) * 0.5
@@ -129,13 +122,7 @@ def visualize_prediction(rgb: np.ndarray, mask_true: np.ndarray, mask_pred: np.n
 
 
 def visualize_ranking(results: list, top_n: int = 10, save_path: str = None):
-    """Visualize top-N greenery-ranked satellite images.
-
-    Args:
-        results: List of dicts with keys 'rgb', 'mask_pred', 'greenery_score', 'filename'
-        top_n: Number of top results to show
-        save_path: If provided, save the figure
-    """
+    """Visualize top-N greenery-ranked satellite images."""
     results_sorted = sorted(results, key=lambda x: x["greenery_score"], reverse=True)[:top_n]
     n = len(results_sorted)
     fig, axes = plt.subplots(2, n, figsize=(3 * n, 7))
