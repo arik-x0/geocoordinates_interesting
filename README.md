@@ -1,4 +1,4 @@
-# geo_interesting
+# Topophilia
 
 A satellite imagery analysis system that detects and scores geographically interesting locations from EuroSAT Sentinel-2 imagery. Nine independent ML submodels each score a different visual dimension of a 64×64 tile. All nine scores are fused by a learned aggregator (`meta/`) into a single **aesthetic heatmap** — the final output of the system.
 
