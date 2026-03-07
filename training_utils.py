@@ -1,7 +1,11 @@
 """
-Shared training utilities used across all three POI model pipelines.
+Shared training utilities used across all nine POI submodel pipelines.
 
-Extracted from per-model train.py files to eliminate duplication.
+Consumed in two ways:
+    - base/trainer.py imports compute_iou, compute_dice, and build_embedding_index,
+      making them available to every submodel through BaseTrainer inheritance.
+    - Individual trainer files import DiceBCELoss directly (all submodels except
+      elevation, which uses its own HeatmapLoss for regression-style heatmap output).
 """
 
 import json
