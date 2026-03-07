@@ -15,10 +15,11 @@ BAND_SWIR  = 10  # Band 11 — 1610 nm
 # ── Vegetation thresholds ────────────────────────────────────────────────────
 NDVI_GREENERY_THRESHOLD = 0.3   # NDVI above this → greenery pixel
 
-# ── Elevation / cliff-water thresholds ───────────────────────────────────────
-NDWI_WATER_THRESHOLD  = 0.3    # NDWI above this → water pixel
-CLIFF_SLOPE_THRESHOLD = 15.0   # slope (degrees) above this → cliff candidate
-POI_PROXIMITY_SIGMA   = 5.0    # Gaussian decay sigma for water proximity (pixels)
+# ── Elevation / terrain thresholds ───────────────────────────────────────────
+NDWI_WATER_THRESHOLD  = 0.3    # NDWI above this → water pixel (used by Water model)
+CLIFF_SLOPE_THRESHOLD = 15.0   # kept for backward compatibility
+POI_PROXIMITY_SIGMA   = 5.0    # kept for backward compatibility
+TERRAIN_RELIEF_WINDOW = 8      # local window (px) for relief & ruggedness computation
 
 # ── Housing density thresholds ───────────────────────────────────────────────
 HOUSING_DENSITY_MIN = 0.05   # at least 5% built-up coverage
@@ -30,3 +31,9 @@ CLOSING_SIZE        = 3      # morphological closing kernel size (pixels)
 # ── Scoring ──────────────────────────────────────────────────────────────────
 POI_TOP_PERCENTILE = 0.10   # top-10% pixel mean used by compute_poi_score()
 GREENERY_THRESHOLD = 0.5    # binarisation threshold for greenery_score_from_prediction()
+
+# ── Aesthetic submodel constants ─────────────────────────────────────────────
+FRACTAL_TARGET_SIGMA  = 0.25   # width of Gaussian bell around target fractal richness
+SYMMETRY_LOCAL_SIZE   = 8      # patch size (px) for local gradient orientation stats
+SUBLIME_COARSE_SIGMA  = 10.0   # Gaussian sigma for large-scale feature smoothing
+COMPLEXITY_TARGET_LEVEL = 0.45 # target normalised local std for optimal complexity

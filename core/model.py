@@ -29,7 +29,7 @@ _DEC_CHANNELS = 128   # output channels of the shared decoder (consumed by submo
 
 # ── Shared decoder building block ────────────────────────────────────────────
 
-class _ConvBlock(nn.Module):
+class _ConvBlockCore(nn.Module):
     """Double 3x3 conv with BN+ReLU — decoder primitive."""
 
     def __init__(self, in_ch: int, out_ch: int):
@@ -71,9 +71,9 @@ class _SharedDecoder(nn.Module):
         self.proj8  = nn.Conv2d(embed_dim, 128, 1)
         self.proj2  = nn.Conv2d(embed_dim,  64, 1)
 
-        self.dec_a = _ConvBlock(256,       256)
-        self.dec_b = _ConvBlock(256 + 128, 128)
-        self.dec_c = _ConvBlock(128 +  64, out_channels)
+        self.dec_a = _ConvBlockCore(256,       256)
+        self.dec_b = _ConvBlockCore(256 + 128, 128)
+        self.dec_c = _ConvBlockCore(128 +  64, out_channels)
 
     @staticmethod
     def _up_cat(d: torch.Tensor, skip: torch.Tensor, size: tuple) -> torch.Tensor:

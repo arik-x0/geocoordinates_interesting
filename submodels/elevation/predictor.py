@@ -1,6 +1,4 @@
-"""
-ElevationPredictor: runs inference with ElevationPOITransUNet and ranks tiles by POI score.
-"""
+"""ElevationPredictor: runs inference and ranks tiles by topographic terrain beauty."""
 
 import sys
 from pathlib import Path
@@ -12,13 +10,15 @@ from base.predictor import BasePredictor                             # noqa: E40
 from dataset import get_elevation_dataloaders as _get_elev_loaders  # noqa: E402
 
 from .model import ElevationPOITransUNet
-from .utils import compute_poi_score, visualize_poi, visualize_poi_ranking
+from .utils import compute_terrain_score, visualize_terrain, visualize_poi_ranking
+from .utils import normalize_channel, TERRAIN_RELIEF_WINDOW
+from scipy.ndimage import maximum_filter, minimum_filter
 
 
 class ElevationPredictor(BasePredictor):
-    """Runs inference with ElevationPOITransUNet and ranks tiles by POI score."""
+    """Runs inference with ElevationPOITransUNet and ranks tiles by terrain beauty score."""
 
-    score_key = "poi_score"
+    score_key = "terrain_score"
 
     def get_test_loader(self):
         args = self.args
@@ -37,81 +37,74 @@ class ElevationPredictor(BasePredictor):
         return inputs[:, :3]
 
     def extra_slice(self, inputs):
-        return inputs[:, 3:]
+        return inputs[:, 3:]   # DEM + slope + aspect topo channels
 
     def build_result(self, i, inputs_cpu, targets_cpu, preds_cpu, metas, embs_cpu):
+        dem   = inputs_cpu[i, 3]
+        slope = inputs_cpu[i, 4]
+        dem_norm  = normalize_channel(dem)
+        local_relief = maximum_filter(dem_norm, size=TERRAIN_RELIEF_WINDOW) \
+                     - minimum_filter(dem_norm, size=TERRAIN_RELIEF_WINDOW)
         return {
-            "rgb":            inputs_cpu[i, :3],
-            "dem":            inputs_cpu[i, 3],
-            "slope":          inputs_cpu[i, 4],
-            "heatmap_true":   targets_cpu[i, 0],
-            "heatmap_pred":   preds_cpu[i, 0],
-            "poi_score":      compute_poi_score(preds_cpu[i, 0]),
-            "class_name":     metas[i]["class_name"],
-            "filepath":       metas[i]["filepath"],
-            "has_water":      metas[i]["has_water"],
-            "has_cliffs":     metas[i]["has_cliffs"],
-            "water_fraction": metas[i]["water_fraction"],
-            "max_slope":      metas[i]["max_slope"],
-            "embedding":      embs_cpu[i],
+            "rgb":           inputs_cpu[i, :3],
+            "dem":           dem,
+            "slope":         slope,
+            "local_relief":  local_relief,
+            "heatmap_true":  targets_cpu[i, 0],
+            "heatmap_pred":  preds_cpu[i, 0],
+            "terrain_score": compute_terrain_score(preds_cpu[i, 0]),
+            "max_slope":     metas[i]["max_slope"],
+            "dem_source":    metas[i]["dem_source"],
+            "class_name":    metas[i]["class_name"],
+            "filepath":      metas[i]["filepath"],
+            "embedding":     embs_cpu[i],
         }
 
     def print_ranking(self, all_results, top_n):
         n      = len(all_results)
-        scores = [r["poi_score"] for r in all_results]
-        n_water  = sum(1 for r in all_results if r["has_water"])
-        n_cliffs = sum(1 for r in all_results if r["has_cliffs"])
-        n_both   = sum(1 for r in all_results if r["has_water"] and r["has_cliffs"])
+        scores = [r["terrain_score"] for r in all_results]
         print(f"\n{'='*80}")
-        print(f"  CLIFF-WATER POI RANKING -- Top {min(top_n, n)} of {n}")
+        print(f"  TERRAIN BEAUTY RANKING -- Top {min(top_n, n)} of {n}")
         print(f"{'='*80}")
-        print(f"  {'Rank':<6} {'POI':<8} {'Water%':<9} {'MaxSlope':<10} {'Class':<18} File")
-        print(f"  {'-'*6} {'-'*8} {'-'*9} {'-'*10} {'-'*18} {'-'*25}")
+        print(f"  {'Rank':<6} {'Score':<8} {'MaxSlope':<10} {'DEM':<8} {'Class':<20} File")
+        print(f"  {'-'*6} {'-'*8} {'-'*10} {'-'*8} {'-'*20} {'-'*25}")
         for rank, r in enumerate(all_results[:top_n], 1):
-            print(f"  {rank:<6} {r['poi_score']:<8.3f} {r['water_fraction']:<9.1%} "
-                  f"{r['max_slope']:<10.1f} {r['class_name']:<18} {Path(r['filepath']).name}")
+            print(f"  {rank:<6} {r['terrain_score']:<8.3f} "
+                  f"{r['max_slope']:<10.1f} {r['dem_source']:<8} "
+                  f"{r['class_name']:<20} {Path(r['filepath']).name}")
         print(f"{'='*80}")
-        print(f"\n  Water: {n_water}/{n} ({n_water/n:.0%})  Cliffs: {n_cliffs}/{n}  "
-              f"Both: {n_both}/{n}  Mean POI: {np.mean(scores):.4f}")
+        print(f"\n  Mean: {np.mean(scores):.4f}  Max: {np.max(scores):.4f}")
         class_scores: dict = {}
         for r in all_results:
-            class_scores.setdefault(r["class_name"], []).append(r["poi_score"])
-        print(f"\n  {'Class':<25} {'Avg POI':<12} {'Max POI':<12} {'Count'}")
-        print(f"  {'-'*25} {'-'*12} {'-'*12} {'-'*10}")
+            class_scores.setdefault(r["class_name"], []).append(r["terrain_score"])
+        print(f"\n  {'Class':<25} {'Avg':<10} {'Max':<10} Count")
+        print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*8}")
         for cls in sorted(class_scores, key=lambda c: np.mean(class_scores[c]), reverse=True):
             avg = np.mean(class_scores[cls])
-            print(f"  {cls:<25} {avg:<12.4f} {np.max(class_scores[cls]):<12.4f} "
-                  f"{len(class_scores[cls]):<10} |{'#' * int(avg * 40)}")
+            print(f"  {cls:<25} {avg:<10.4f} {np.max(class_scores[cls]):<10.4f} "
+                  f"{len(class_scores[cls]):<8} |{'#' * int(avg * 40)}")
 
     def print_similarity(self, result, rank, similar):
-        print(f"\n  Rank #{rank}  {result['class_name']}  poi={result['poi_score']:.4f}"
-              f"  ({Path(result['filepath']).name})")
-        print(f"  {'Sim':>6}  {'Split':<6}  {'Water':<6}  {'Cliffs':<7}  {'Class':<20}  File")
+        print(f"\n  Rank #{rank}  {result['class_name']}  "
+              f"terrain={result['terrain_score']:.4f}  "
+              f"({Path(result['filepath']).name})")
+        print(f"  {'Sim':>6}  {'Split':<6}  {'Class':<22}  File")
         for s in similar:
             print(f"  {s['similarity']:>6.4f}  {s['split']:<6}  "
-                  f"{'yes' if s.get('has_water') else 'no':<6}  "
-                  f"{'yes' if s.get('has_cliffs') else 'no':<7}  "
-                  f"{s['class_name']:<20}  {Path(s['filepath']).name}")
+                  f"{s['class_name']:<22}  {Path(s['filepath']).name}")
 
     def save_visualizations(self, all_results, output_dir, top_n):
-        print(f"\nSaving top-{min(top_n, len(all_results))} POI visualizations...")
+        print(f"\nSaving top-{min(top_n, len(all_results))} terrain visualizations...")
         for rank, r in enumerate(all_results[:top_n], 1):
-            visualize_poi(
+            visualize_terrain(
                 rgb=r["rgb"], dem=r["dem"], slope=r["slope"],
-                water_mask=np.zeros_like(r["dem"]),
+                local_relief=r["local_relief"],
                 heatmap_true=r["heatmap_true"], heatmap_pred=r["heatmap_pred"],
-                poi_score=r["poi_score"],
-                save_path=str(output_dir / f"poi_rank_{rank:02d}_{r['class_name']}.png"),
+                terrain_score=r["terrain_score"],
+                save_path=str(output_dir / f"terrain_{rank:02d}_{r['class_name']}.png"),
             )
-        visualize_poi_ranking(all_results, top_n=min(10, len(all_results)),
-                              save_path=str(output_dir / "poi_ranking_overview.png"))
+        visualize_poi_ranking(
+            all_results, top_n=min(10, len(all_results)),
+            save_path=str(output_dir / "terrain_ranking_overview.png"),
+        )
         print("Ranking overview saved.")
-        print(f"\nSaving bottom-5 (lowest POI) for comparison...")
-        for rank, r in enumerate(all_results[-5:], 1):
-            visualize_poi(
-                rgb=r["rgb"], dem=r["dem"], slope=r["slope"],
-                water_mask=np.zeros_like(r["dem"]),
-                heatmap_true=r["heatmap_true"], heatmap_pred=r["heatmap_pred"],
-                poi_score=r["poi_score"],
-                save_path=str(output_dir / f"low_poi_{rank:02d}_{r['class_name']}.png"),
-            )
