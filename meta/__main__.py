@@ -5,7 +5,7 @@ from .predictor import AestheticPredictor
 
 def _build_parser():
     parser = argparse.ArgumentParser(
-        description="Aesthetic Meta-Aggregator: fuses all 6 aesthetic submodels")
+        description="Aesthetic Meta-Aggregator: fuses all 9 submodels")
     sub = parser.add_subparsers(dest="command", required=True)
     pp = sub.add_parser("predict", help="Run full aesthetic pipeline")
     pp.add_argument("--data-dir",        type=str, default="data",

@@ -67,7 +67,24 @@ class ElevationPOITransUNet(BaseSubmodel):
 
         self.register_buffer("_gauss", _gaussian_kernel(_KERNEL_SIZE, _SIGMA))
 
-    def forward(self, feature_map: torch.Tensor, topo: torch.Tensor) -> torch.Tensor:
+    def forward(self, feature_map: torch.Tensor,
+                topo: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            feature_map: (B, 128, H, W) from CoreSatelliteModel.decode()
+            topo:        (B, 3, H, W) DEM elevation + slope + aspect.
+                         Defaults to zeros when not provided (e.g. in the meta
+                         aesthetic pipeline where only RGB is available). The
+                         model still produces meaningful terrain-beauty output
+                         via the RGB feature stream; the topo stream contributes
+                         nothing when zeroed.
+        """
+        if topo is None:
+            topo = torch.zeros(
+                feature_map.size(0), 3,
+                feature_map.size(2), feature_map.size(3),
+                device=feature_map.device, dtype=feature_map.dtype,
+            )
         rgb_feat  = self.proj(feature_map)                # (B, 64, 64, 64)
         topo_feat = self.topo_enc2(self.topo_enc1(topo))  # (B, 64, 64, 64)
 

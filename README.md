@@ -1,6 +1,6 @@
 # geo_interesting
 
-A satellite imagery analysis system that detects and scores geographically interesting locations from EuroSAT Sentinel-2 imagery. Nine independent ML submodels each score a different visual/aesthetic dimension of a 64×64 tile. Six of those scores are fused by a learned aggregator (`meta/`) into a single **aesthetic heatmap** — the final output of the system.
+A satellite imagery analysis system that detects and scores geographically interesting locations from EuroSAT Sentinel-2 imagery. Nine independent ML submodels each score a different visual dimension of a 64×64 tile. All nine scores are fused by a learned aggregator (`meta/`) into a single **aesthetic heatmap** — the final output of the system.
 
 ---
 
@@ -27,25 +27,23 @@ A satellite imagery analysis system that detects and scores geographically inter
               |
      (B, 128, 64, 64) shared feature map
               |
-    ┌─────────┴──────────────────────────────────────────────┐
-    │         Nine independent task heads                     │
-    │                                                         │
-    │  GEOGRAPHIC / STRUCTURAL                                │
-    │  ├── vegetation/    TransUNet        → (B,1,64,64)     │
-    │  ├── housing/       HousingEdgeCNN  → (B,1,64,64)     │
-    │  └── elevation/     ElevPOITransUNet→ (B,1,64,64) ←─  │
-    │                        + topo input (DEM/slope/aspect) │
-    │                                                         │
-    │  AESTHETIC                                              │
-    │  ├── fractal/       FractalPatternNet → (B,1,64,64)   │
-    │  ├── water/         WaterGeometryNet  → (B,1,64,64)   │
-    │  ├── color_harmony/ ColorHarmonyNet   → (B,1,64,64)   │
-    │  ├── symmetry/      SymmetryOrderNet  → (B,1,64,64)   │
-    │  ├── sublime/       ScaleSublimeNet   → (B,1,64,64)   │
-    │  └── complexity/    ComplexityBalance → (B,1,64,64)   │
-    └─────────────────────────┬───────────────────────────────┘
+    ┌─────────┴──────────────────────────────────────────────────┐
+    │               Nine task heads (all equal)                   │
+    │                                                             │
+    │  ├── fractal/       FractalPatternNet  → (B,1,64,64)      │
+    │  ├── water/         WaterGeometryNet   → (B,1,64,64)      │
+    │  ├── color_harmony/ ColorHarmonyNet    → (B,1,64,64)      │
+    │  ├── symmetry/      SymmetryOrderNet   → (B,1,64,64)      │
+    │  ├── sublime/       ScaleSublimeNet    → (B,1,64,64)      │
+    │  ├── complexity/    ComplexityBalance  → (B,1,64,64)      │
+    │  ├── vegetation/    TransUNet          → (B,1,64,64)      │
+    │  ├── elevation/     ElevPOITransUNet   → (B,1,64,64)      │
+    │  │                    + optional topo (DEM/slope/aspect)  │
+    │  └── housing/       HousingEdgeCNN    → (B,1,64,64)      │
+    └─────────────────────────┬───────────────────────────────────┘
                               │
-              6 aesthetic heatmaps stacked → (B, 6, 64, 64)
+         9 heatmaps stacked → (B, 9, 64, 64)
+         (housing inverted to urban_openness before stacking)
                               │
               ┌───────────────▼──────────────┐
               │       AestheticAggregator     │   meta/model.py
@@ -79,33 +77,10 @@ geo_interesting/
 │   ├── predictor.py          ← BasePredictor (Template Method pattern)
 │   └── utils.py              ← VectorDB (FAISS cosine similarity index)
 │
-├── submodels/
+├── submodels/                ← all nine task heads — structurally equal
 │   │
-│   │  ── Geographic / Structural ──────────────────────────────────────
-│   ├── vegetation/           ← greenery density detection
-│   │   ├── model.py          ← TransUNet (SE channel-attention, ~0.2M params)
-│   │   ├── trainer.py        ← VegetationTrainer
-│   │   ├── predictor.py      ← VegetationPredictor
-│   │   ├── utils.py          ← NDVI, greenery scoring, visualization
-│   │   └── __main__.py       ← CLI entry: python -m submodels.vegetation
-│   │
-│   ├── housing/              ← built-up structure / urban density detection
-│   │   ├── model.py          ← HousingEdgeCNN (HED-style dual path, ~0.07M params)
-│   │   ├── trainer.py        ← HousingTrainer
-│   │   ├── predictor.py      ← HousingPredictor
-│   │   ├── utils.py          ← NDBI, edge labels, visualization
-│   │   └── __main__.py       ← CLI entry: python -m submodels.housing
-│   │
-│   ├── elevation/            ← topographic terrain beauty detection
-│   │   ├── model.py          ← ElevationPOITransUNet (topo-fusion head, ~0.35M params)
-│   │   ├── trainer.py        ← ElevationTrainer
-│   │   ├── predictor.py      ← ElevationPredictor
-│   │   ├── utils.py          ← SRTM DEM, slope/aspect, terrain labels, visualization
-│   │   └── __main__.py       ← CLI entry: python -m submodels.elevation
-│   │
-│   │  ── Aesthetic ─────────────────────────────────────────────────────
 │   ├── fractal/              ← self-similar repeating patterns
-│   │   ├── model.py          ← FractalPatternNet (multi-scale laplacian, ~0.18M params)
+│   │   ├── model.py          ← FractalPatternNet (multi-scale dilated, ~0.18M params)
 │   │   ├── trainer.py        ← FractalTrainer
 │   │   ├── predictor.py      ← FractalPredictor
 │   │   ├── utils.py          ← Laplacian pyramid fractal label
@@ -139,18 +114,41 @@ geo_interesting/
 │   │   ├── utils.py          ← coarse/fine luminance contrast label
 │   │   └── __main__.py       ← CLI entry: python -m submodels.sublime
 │   │
-│   └── complexity/           ← information density at perceptual optimum
-│       ├── model.py          ← ComplexityBalanceNet (order + chaos paths, ~0.13M params)
-│       ├── trainer.py        ← ComplexityTrainer
-│       ├── predictor.py      ← ComplexityPredictor
-│       ├── utils.py          ← local gradient std Gaussian-bell label
-│       └── __main__.py       ← CLI entry: python -m submodels.complexity
+│   ├── complexity/           ← information density at perceptual optimum
+│   │   ├── model.py          ← ComplexityBalanceNet (order + chaos paths, ~0.13M params)
+│   │   ├── trainer.py        ← ComplexityTrainer
+│   │   ├── predictor.py      ← ComplexityPredictor
+│   │   ├── utils.py          ← local gradient std Gaussian-bell label
+│   │   └── __main__.py       ← CLI entry: python -m submodels.complexity
+│   │
+│   ├── vegetation/           ← greenery density (biophilia signal)
+│   │   ├── model.py          ← TransUNet (SE channel-attention, ~0.2M params)
+│   │   ├── trainer.py        ← VegetationTrainer
+│   │   ├── predictor.py      ← VegetationPredictor
+│   │   ├── utils.py          ← NDVI, greenery scoring, visualization
+│   │   └── __main__.py       ← CLI entry: python -m submodels.vegetation
+│   │
+│   ├── elevation/            ← topographic terrain beauty (SBE-grounded)
+│   │   ├── model.py          ← ElevationPOITransUNet (topo-fusion head, ~0.35M params)
+│   │   │                        topo=None defaults to zeros (usable without DEM)
+│   │   ├── trainer.py        ← ElevationTrainer
+│   │   ├── predictor.py      ← ElevationPredictor
+│   │   ├── utils.py          ← SRTM DEM, slope/aspect, terrain labels, visualization
+│   │   └── __main__.py       ← CLI entry: python -m submodels.elevation
+│   │
+│   └── housing/              ← built-up structure detection (urban density)
+│       ├── model.py          ← HousingEdgeCNN (HED-style dual path, ~0.07M params)
+│       ├── trainer.py        ← HousingTrainer
+│       ├── predictor.py      ← HousingPredictor
+│       ├── utils.py          ← NDBI, edge labels, visualization
+│       └── __main__.py       ← CLI entry: python -m submodels.housing
 │
 ├── meta/                     ← final aesthetic aggregation (NOT a submodel)
-│   ├── model.py              ← AestheticAggregator (SE attention + spatial CNN, ~0.04M)
-│   ├── predictor.py          ← AestheticPredictor (runs full 6-submodel pipeline)
+│   ├── model.py              ← AestheticAggregator (SE attention + spatial CNN, ~0.05M)
+│   ├── predictor.py          ← AestheticPredictor (runs full 9-submodel pipeline)
 │   └── __main__.py           ← CLI entry: python -m meta
 │
+├── vectordb_shared_index.py  ← builds one unified FAISS index for the whole project
 ├── constants.py              ← band indices, thresholds, scoring constants
 ├── training_utils.py         ← shared losses, metrics, FAISS index builder
 └── dataset.py                ← dataset loaders for all submodel tasks
@@ -191,56 +189,35 @@ Output `(B, 128, 64, 64)` is the input to every task head.
 
 ## Submodels
 
-### Geographic / Structural submodels
-
-These three models detect structured geographic features and are trained and used independently of the aesthetic pipeline.
-
-#### Vegetation — `submodels/vegetation/`
-
-Detects greenery and vegetation coverage.
-
-- **Pseudo-label**: NDVI from bands 4 (Red) and 8 (NIR), thresholded at 0.3
-- **Architecture**: `TransUNet` — ConvBlock(128→64) + SE channel-attention + Conv(64→1), ~0.2M params
-- **Score**: mean NDVI over the predicted heatmap, weighted by confidence
-
-#### Housing — `submodels/housing/`
-
-Detects built-up structures and urban density.
-
-- **Pseudo-label**: NDBI from bands 11 (SWIR) and 8 (NIR) + Sobel edge gradient → threshold + morphological closing
-- **Architecture**: `HousingEdgeCNN` — direct intensity path + depthwise edge path → fusion Conv(2→1), ~0.07M params
-- **Score**: mean predicted structure density
-
-#### Elevation — `submodels/elevation/`
-
-Detects topographic terrain beauty — mountains, ridges, canyons, glacial cirques.
-
-Grounded in **Scenic Beauty Estimation (SBE)** research (Daniel & Boster, US Forest Service), which shows topographic heterogeneity independently predicts scenic quality. The model is entirely water-independent.
-
-- **Pseudo-label**: three terrain signals derived from SRTM DEM + computed slope:
-  - **Local relief** (40%) — `max - min` elevation in an 8px window: rewards mountains and canyons
-  - **Slope ruggedness** (40%) — local std of slope angles: rewards heterogeneous inclines (cliffs mixed with ledges)
-  - **Ridgeline curvature** (20%) — gradient magnitude of slope: rewards sharp ridge crests, cliff tops, erosion gullies
-- **Architecture**: `ElevationPOITransUNet` — proj(128→64) + topo CNN(3→32→64) fusing DEM/slope/aspect + Gaussian blur, ~0.35M params
-- **Extra input**: `topo (B, 3, 64, 64)` containing DEM, slope, and aspect channels (synthetic or real SRTM)
-- **Score**: mean terrain ruggedness weighted by predicted heatmap confidence
-
----
-
-### Aesthetic submodels
-
-Six models each capture an independent aesthetic dimension of a landscape. Their heatmaps are fed to the `meta/` aggregator for the final score. Each model has no overlap with the others — the dimensions are designed to be orthogonal.
+All nine submodels are **structurally equal** — they share the same `BaseSubmodel` base class, the same training loop, and the same `(B, 128, 64, 64)` → `(B, 1, 64, 64)` interface. All nine feed into the `AestheticAggregator`. The distinction between "visual aesthetic" and "geographic/structural" is semantic, not architectural.
 
 | Submodel | What it detects | Pseudo-label signal | Architecture | Params |
 |---|---|---|---|---|
-| `fractal` | Self-similar repeating patterns across scales | Laplacian pyramid inter-scale correlation | Multi-scale Laplacian paths | ~0.18M |
-| `water` | Water body geometry, clarity, and reflectance | NDWI (bands 3+8) water mask + edge geometry | NDWI spectral path + edge CNN path | ~0.14M |
-| `color_harmony` | Chromatic richness and spectral diversity | 60% HSV saturation + 40% cross-band spectral std (all 13 bands) | Chroma SE-attention + depthwise spectral path | ~0.15M |
-| `symmetry` | Structural order and directional regularity | Gradient circular variance (mean resultant length R) | 4-directional convs (H, V, D1, D2) | ~0.12M |
-| `sublime` | Multi-scale contrast and large-scale drama | \|fine detail − coarse structure\| luminance difference | 3-scale residual contrast (4×, 8×, 16× pool) | ~0.10M |
-| `complexity` | Information density at perceptual optimum | Local gradient std → Gaussian bell centred at 0.45 | Order path (smooth) × chaos path (local) | ~0.13M |
+| `fractal` | Self-similar patterns across scales | Laplacian pyramid inter-scale correlation | Multi-scale dilated conv (d=1,2,4) | ~0.18M |
+| `water` | Water body geometry and reflectance | NDWI (bands 3+8) mask + edge geometry | NDWI spectral path + edge CNN path | ~0.14M |
+| `color_harmony` | Chromatic richness and spectral diversity | 60% HSV saturation + 40% cross-band spectral std | Chroma SE-attention + depthwise spectral path | ~0.15M |
+| `symmetry` | Structural order and directional regularity | Gradient circular variance (mean resultant R) | 4-directional convs (H, V, D1, D2) | ~0.12M |
+| `sublime` | Multi-scale contrast and large-scale drama | \|fine detail − coarse structure\| luminance diff | 3-scale residual contrast (4×, 8×, 16× pool) | ~0.10M |
+| `complexity` | Information density at perceptual optimum | Local gradient std → Gaussian bell at 0.45 | Order path (smooth) × chaos path (local std) | ~0.13M |
+| `vegetation` | Greenery density — biophilia signal | NDVI (NIR − R)/(NIR + R) threshold at 0.3 | ConvBlock(128→64) + SE channel-attention | ~0.20M |
+| `elevation` | Terrain ruggedness and scenic beauty | Local relief + slope variance + ridgeline curvature (SBE) | proj(128→64) + topo CNN(3→32→64) fusion | ~0.35M |
+| `housing` | Built-up structure density | NDBI (SWIR − NIR)/(SWIR + NIR) + Sobel + morph close | Direct path + depthwise edge path → fusion | ~0.07M |
 
-**Signal ownership — no overlap:**
+### Research basis for the structural submodels in the aesthetic pipeline
+
+**Vegetation** feeds a direct positive aesthetic signal. The biophilia hypothesis (Wilson, 1984) posits an innate genetic drive to connect with nature. Attention Restoration Theory (Kaplan, 1995) shows greenery directly reduces directed-attention fatigue — the same mechanism underlying aesthetic pleasure in natural landscapes.
+
+**Elevation** feeds a direct positive aesthetic signal. Scenic Beauty Estimation research (Daniel & Boster) shows topographic heterogeneity (local relief, slope ruggedness, ridgeline curvature) independently predicts scenic quality regardless of other visual factors. The model captures terrain structure visible in RGB that the visual-only `sublime` model cannot fully capture.
+
+**Housing** feeds an **inverted** signal to the aggregator (`urban_openness = 1 − housing_pred`). Attention Restoration Theory establishes that high building density increases cognitive load, reducing restorative experience and aesthetic pleasure. The aggregator's SE channel attention learns the per-scene weight of this signal: a natural landscape is boosted by high urban openness; a geometrically beautiful urban scene can still score high via `color_harmony` or `symmetry` despite low urban openness.
+
+Note: `housing_score` stored in the VectorDB metadata reflects raw building presence (not inverted) for standalone use. Only the aggregation inverts it.
+
+### Elevation model — optional topo input
+
+`ElevationPOITransUNet.forward()` accepts `topo=None`. When `topo` is not provided, the model creates a zero tensor automatically and operates using the RGB feature stream only. Terrain structure visible in RGB (ridge shadows, texture contrasts) still contributes meaningfully. Pass real `topo (B, 3, H, W)` during training and standalone prediction for full accuracy.
+
+### Signal ownership — no overlap
 
 | Signal | Owner |
 |---|---|
@@ -258,37 +235,45 @@ Six models each capture an independent aesthetic dimension of a landscape. Their
 
 ## Meta — AestheticAggregator
 
-The `meta/` directory is **not a submodel** — it sits downstream of the aesthetic submodels and fuses their outputs into the final result. It does not receive the shared feature map; it receives six pre-computed heatmaps.
+The `meta/` directory is **not a submodel** — it sits downstream of all nine submodels and fuses their heatmaps into the final result. It does not receive the shared feature map; it receives nine pre-computed heatmaps.
 
 ### What it does
 
-Given the six aesthetic heatmaps stacked as `(B, 6, 64, 64)`, the `AestheticAggregator` learns:
+Given the nine heatmaps stacked as `(B, 9, 64, 64)`, the `AestheticAggregator` learns:
 
-1. **Which aesthetic dimension matters most** for this image (channel SE attention)
+1. **Which dimension matters most** for this image (channel SE attention)
 2. **Where** in the image those dimensions align spatially (spatial CNN fusion)
+
+The SE channel attention naturally specialises per scene type: for a forest tile it weights vegetation and fractal heavily; for a mountain it weights elevation and sublime; for an urban architectural scene it weights color harmony and symmetry while discounting urban openness.
 
 ### Architecture (`meta/model.py`)
 
 ```
-input:  (B, 6, 64, 64)  — 6 stacked aesthetic heatmaps
+input:  (B, 9, 64, 64)  — 9 stacked heatmaps
+                           [fractal, water, color_harmony, symmetry, sublime,
+                            complexity, vegetation, elevation, urban_openness]
            |
   Channel attention (SE):
-    GlobalAvgPool → flatten → Linear(6→3) → ReLU → Linear(3→6) → Sigmoid
-    → per-channel weights  (B, 6)
+    GlobalAvgPool → flatten → Linear(9→4) → ReLU → Linear(4→9) → Sigmoid
+    → per-channel weights  (B, 9)
            |
-  Element-wise weight:  heatmaps × weights  →  (B, 6, 64, 64)
+  Element-wise weight:  heatmaps × weights  →  (B, 9, 64, 64)
            |
   Spatial fusion:
-    Conv(6→16, 3×3) → BN → ReLU → Conv(16→1, 1×1) → Sigmoid
+    Conv(9→16, 3×3) → BN → ReLU → Conv(16→1, 1×1) → Sigmoid
            |
 output: (B, 1, 64, 64)  — unified aesthetic heatmap  ← FINAL OUTPUT
 ```
 
-~0.04M params — intentionally tiny, since inputs are already high-level semantic maps.
+~0.05M params — intentionally tiny, since inputs are already high-level semantic maps.
 
 ### Why it is separate from `submodels/`
 
-The submodels all share the same `CoreSatelliteModel` feature map as input. `meta/` operates on a completely different input (pre-computed heatmaps) and requires all six submodels to have been trained first. It is an aggregator, not a feature extractor.
+The submodels all receive the shared feature map `(B, 128, 64, 64)` as input and are trained independently. `meta/` operates on a completely different input (pre-computed heatmaps from all nine trained submodels) and requires all nine to have been trained first. It is an aggregator, not a feature extractor.
+
+### Decoder strategy at inference
+
+All nine submodels run against a single shared decoder state in the meta pipeline. The decoder is loaded from the first available checkpoint in registry order. This is a deliberate single-pass trade-off: running nine separate forward passes with nine different decoders would be 9× more expensive. In practice, all decoders converge toward the same general satellite feature extraction goal, so the shared decoder produces sufficiently accurate feature maps for all task heads.
 
 ---
 
@@ -298,61 +283,112 @@ The `(B, 1, 64, 64)` tensor produced by `AestheticAggregator` is the system's pr
 
 - Values in `[0, 1]` — higher = more aesthetically compelling
 - Spatially aligned with the original tile — every pixel has a score
-- Learned, not hand-crafted — the aggregator discovers which combination of fractal patterns, water, colour, symmetry, scale drama, and complexity makes a location interesting
-- Interpretable — `channel_weights()` reveals which aesthetic dimension drove the score for any given tile
+- Learned, not hand-crafted — the aggregator discovers which combination of nine dimensions makes a location interesting
+- Interpretable — `channel_weights()` reveals which dimension drove the score for any given tile
 
-The `AestheticPredictor` (`meta/predictor.py`) saves a 2×4 panel visualization per image showing all six submodel heatmaps alongside the fused result and the per-submodel learned weights as a bar chart.
+The `AestheticPredictor` (`meta/predictor.py`) saves a **3×4 panel** visualization per image:
+
+```
+Row 0:  RGB satellite | fractal | water | color_harmony
+Row 1:  symmetry | sublime | complexity | vegetation
+Row 2:  elevation | urban_openness | [blank] | aesthetic fusion overlay
+```
+
+Each submodel panel shows its learned channel weight `w=…` as a subtitle.
 
 ---
 
 ## VectorDB — Similarity Search
 
-The `VectorDB` ([base/utils.py](base/utils.py)) is a FAISS-backed cosine similarity index built automatically at the end of training for each submodel.
+The `VectorDB` ([base/utils.py](base/utils.py)) is a FAISS-backed cosine similarity index. The project uses a single **shared index** built by `vectordb_shared_index.py` that covers every EuroSAT tile with a complete scoring profile.
 
-### How it works
+### Shared index — one index for the whole project
 
 ```
-Training loop
+vectordb_shared_index.py  (5 passes, single CoreSatelliteModel in memory)
+    |
+    Pass 1: all 9 submodel heads run → per-tile scores + CLS embeddings
+    Pass 2: vegetation model with its own trained decoder (more accurate score)
+    Pass 3: housing model with its own trained decoder
+    Pass 4: elevation model with its own trained decoder + synthetic DEM
+    Pass 5: FAISS IndexFlatIP built from CLS embeddings
+    |
+    └── checkpoints/shared/shared_index.faiss
+    └── checkpoints/shared/shared_index_meta.json
+```
+
+Each entry in the index stores:
+
+```json
+{
+  "filepath": "...", "class_name": "Forest",
+  "aesthetic_score": 0.74, "aesthetic_weights": [0.12, 0.08, ...],
+  "fractal_score": 0.81, "water_score": 0.12, "color_score": 0.67,
+  "symmetry_score": 0.43, "sublime_score": 0.55, "complexity_score": 0.60,
+  "vegetation_score": 0.89, "terrain_score": 0.34, "housing_score": 0.03
+}
+```
+
+### Loading and querying
+
+```python
+from base.utils import VectorDB
+from pathlib import Path
+
+vdb = VectorDB.load_shared(Path("checkpoints/shared"))
+
+# Visually similar tiles
+vdb.query(embedding, top_k=10)
+
+# Similar tiles that are also highly aesthetic
+vdb.query(embedding, top_k=10,
+          filter_fn=lambda m: m["aesthetic_score"] > 0.7)
+
+# Similar water landscapes
+vdb.query(embedding, top_k=10,
+          filter_fn=lambda m: m["water_score"] > 0.65)
+
+# High fractal + high color harmony (natural patterned landscapes)
+vdb.query(embedding, top_k=10,
+          filter_fn=lambda m: m["fractal_score"] > 0.5
+                          and m["color_score"] > 0.5)
+
+# High vegetation + low housing (undeveloped green areas)
+vdb.query(embedding, top_k=10,
+          filter_fn=lambda m: m["vegetation_score"] > 0.7
+                          and m["housing_score"] < 0.1)
+```
+
+The `filter_fn` over-retrieves `top_k × 10` candidates and filters before returning, so the result set is always exactly `top_k` (or fewer if not enough pass the filter).
+
+### How the index works
+
+```
+Training / index build
     |
     └── for each tile:
-            CLS token (B, 384)  ← from DINO backbone (frozen)
+            CLS token (B, 384)  ← from DINO backbone (frozen — same for all submodels)
             L2-normalise  →  unit vector
-            store in FAISS IndexFlatIP + metadata JSON
+            FAISS IndexFlatIP   (inner product on L2-normed = cosine similarity)
 
-Inference (predict)
+Query
     |
-    └── for each top-scoring tile:
-            query VectorDB with its CLS embedding
-            retrieve top-K most cosine-similar tiles from training set
-            display as "visually similar" recommendations
+    └── for any tile's CLS embedding:
+            retrieve top-K most cosine-similar tiles
+            optionally filter by any score field via filter_fn
 ```
-
-### What it enables
-
-- **Content-based retrieval**: given an interesting tile, find visually similar tiles without re-running the model
-- **Cluster inspection**: understand what the model learned by seeing which tiles cluster together
-- **Cross-submodel reuse**: because CLS embeddings come from the shared frozen backbone, the VectorDB built during vegetation training is semantically consistent with embeddings from elevation or water training
-
-### Files
-
-| File | Contents |
-|---|---|
-| `embedding_index.faiss` | FAISS IndexFlatIP of L2-normalised CLS embeddings |
-| `embedding_meta.json` | Per-vector metadata (file path, score, coordinates) aligned with index |
-
-VectorDB is optional — the system runs without it if `faiss-cpu` is not installed. Missing index files produce a warning, not an error.
 
 ---
 
 ## Ground Truth — Pseudo-labels
 
-No manual annotations. All training targets are derived algorithmically from the spectral bands or topographic data.
+No manual annotations. All training targets are derived algorithmically from spectral bands or topographic data.
 
 | Submodel | Label generation |
 |---|---|
 | `vegetation` | NDVI = (NIR − R) / (NIR + R), threshold at 0.3 |
 | `housing` | NDBI = (SWIR − NIR) / (SWIR + NIR) + Sobel edge → morph closing |
-| `elevation` | SRTM DEM → local relief + slope ruggedness + ridgeline curvature |
+| `elevation` | SRTM DEM → 40% local relief + 40% slope ruggedness + 20% ridgeline curvature |
 | `fractal` | Laplacian pyramid → inter-scale correlation → Gaussian smoothing |
 | `water` | NDWI = (G − NIR) / (G + NIR) → threshold + distance-weighted mask |
 | `color_harmony` | HSV saturation (60%) + cross-band spectral std across all 13 bands (40%) |
@@ -370,7 +406,6 @@ All submodels share the same training loop from `BaseTrainer`:
 - `ReduceLROnPlateau` scheduler (`patience=3`, `factor=0.5`)
 - IoU + Dice metrics, best-model checkpoint saved automatically
 - Per-epoch JSON training log
-- FAISS VectorDB built from all CLS embeddings at the end of training
 
 ### Loss functions
 
@@ -385,7 +420,6 @@ All submodels share the same training loop from `BaseTrainer`:
 | `symmetry` | MSE + soft-Dice |
 | `sublime` | MSE + soft-Dice |
 | `complexity` | MSE + soft-Dice |
-| `meta` (aggregator) | MSE against mean of input heatmaps as self-supervised target |
 
 ### Checkpoint format
 
@@ -405,58 +439,40 @@ All submodels share the same training loop from `BaseTrainer`:
 
 ## Running
 
-All commands run from the project root.
+All commands run from the project root. Train all nine submodels before running `meta predict` or building the shared VectorDB.
 
-### Geographic / Structural submodels
-
-```bash
-# Vegetation
-python -m submodels.vegetation train   --epochs 25 --data-dir data
-python -m submodels.vegetation predict --checkpoint checkpoints/vegetation/best_model.pth
-
-# Housing
-python -m submodels.housing train   --epochs 25 --data-dir data
-python -m submodels.housing predict --checkpoint checkpoints/housing/best_model.pth
-
-# Elevation (synthetic DEM)
-python -m submodels.elevation train   --epochs 25 --data-dir data
-# Elevation (real SRTM DEM — downloads tiles automatically)
-python -m submodels.elevation train   --epochs 25 --data-dir data --use-real-dem
-python -m submodels.elevation predict --checkpoint checkpoints/elevation/best_model.pth
-```
-
-### Aesthetic submodels
-
-Train each independently. Order does not matter.
+### Train all submodels
 
 ```bash
+# Visual aesthetic submodels
 python -m submodels.fractal       train --epochs 25 --data-dir data
 python -m submodels.water         train --epochs 25 --data-dir data
 python -m submodels.color_harmony train --epochs 25 --data-dir data
 python -m submodels.symmetry      train --epochs 25 --data-dir data
 python -m submodels.sublime       train --epochs 25 --data-dir data
 python -m submodels.complexity    train --epochs 25 --data-dir data
+
+# Structural submodels
+python -m submodels.vegetation train --epochs 25 --data-dir data
+python -m submodels.housing    train --epochs 25 --data-dir data
+python -m submodels.elevation  train --epochs 25 --data-dir data              # synthetic DEM
+python -m submodels.elevation  train --epochs 25 --data-dir data --use-real-dem  # real SRTM DEM
 ```
 
-Run predict on any individual aesthetic submodel:
+Order does not matter — all nine are independent.
+
+### Run individual submodel prediction
 
 ```bash
-python -m submodels.fractal predict --checkpoint checkpoints/fractal/best_model.pth
-# (same pattern for water, color_harmony, symmetry, sublime, complexity)
+python -m submodels.fractal    predict --checkpoint checkpoints/fractal/best_model.pth
+python -m submodels.vegetation predict --checkpoint checkpoints/vegetation/best_model.pth
+python -m submodels.elevation  predict --checkpoint checkpoints/elevation/best_model.pth
+# (same pattern for all nine)
 ```
 
-### Meta aggregator — full aesthetic pipeline
+### Meta aggregator — full 9-submodel aesthetic pipeline
 
-Train the aggregator after all six aesthetic submodels have been trained:
-
-```bash
-python -m meta train \
-    --data-dir data \
-    --checkpoint-dir checkpoints \
-    --epochs 10
-```
-
-Run the full pipeline (loads all six submodels + aggregator, produces final heatmaps):
+Run the full pipeline (loads all nine submodels + aggregator, produces final heatmaps):
 
 ```bash
 python -m meta predict \
@@ -476,18 +492,36 @@ checkpoints/
 ├── symmetry/best_model.pth
 ├── sublime/best_model.pth
 ├── complexity/best_model.pth
-└── meta/best_model.pth
+├── vegetation/best_model.pth
+├── elevation/best_model.pth
+├── housing/best_model.pth
+└── meta/best_model.pth          (optional — equal weights used if absent)
 ```
+
+### Build the shared VectorDB
+
+Run after all nine submodels have been trained:
+
+```bash
+python vectordb_shared_index.py \
+    --data-dir data \
+    --checkpoint-dir checkpoints \
+    --output-dir checkpoints/shared \
+    --batch-size 32
+```
+
+Output: `checkpoints/shared/shared_index.faiss` + `checkpoints/shared/shared_index_meta.json`
 
 ### Key CLI arguments
 
 | Argument | Default | Applies to |
 |---|---|---|
-| `--epochs` | 25 | all |
-| `--batch-size` | 32 (veg) / 16 (others) | all |
+| `--epochs` | 25 | all submodels |
+| `--batch-size` | 32 | all |
 | `--lr` | 1e-3 | all |
 | `--data-dir` | `data` | all |
-| `--checkpoint` | — | predict commands |
+| `--checkpoint` | — | submodel predict |
+| `--checkpoint-dir` | `checkpoints` | meta predict, vectordb |
 | `--output-dir` | `output/<task>` | predict commands |
 | `--top-n` | 20 | predict commands |
 | `--ndvi-threshold` | 0.3 | vegetation only |
@@ -497,14 +531,13 @@ checkpoints/
 
 ## Outputs
 
-Each predictor saves to `output/<task>/`:
+Each submodel predictor saves to `output/<task>/`:
 
-- Per-image visualizations ranked by score (top-N and bottom-5)
-- Ranking overview grid image
-- Console table with score statistics
-- VectorDB similarity results for top predictions
+- Per-image visualizations ranked by score (top-N)
+- Console table with score statistics and per-class average bars
+- VectorDB similarity results for top predictions (if shared index is present)
 
-The `meta` predictor additionally saves a **2×4 panel** per image showing all six submodel heatmaps, the fused final heatmap, and a bar chart of learned per-dimension weights.
+The `meta` predictor saves a **3×4 panel** per image showing all nine submodel heatmaps with learned channel weights, plus the fused aesthetic overlay.
 
 ---
 
@@ -512,7 +545,6 @@ The `meta` predictor additionally saves a **2×4 panel** per image showing all s
 
 ```
 torch>=2.0.0
-timm>=0.9.2        # DINO ViT-S/16 pretrained backbone
 numpy>=1.24.0
 matplotlib>=3.7.0
 tqdm>=4.65.0

@@ -39,12 +39,14 @@ After building, load and query with VectorDB.load_shared():
                                         and m["color_score"] > 0.5)
 
 Notes:
-  - Aesthetic pass (Pass 1) loads a single decoder shared across all 6 aesthetic
-    submodels, consistent with how meta/predictor.py operates.
-  - Structural submodels (vegetation, housing, elevation) each load their own
-    trained decoder for accurate scores.
-  - Any submodel whose checkpoint is missing is skipped gracefully; its score
-    field will be absent from affected tile entries.
+  - Pass 1 (aesthetic) runs all 9 submodels with a single shared decoder (from
+    the first available aesthetic checkpoint). Geo heads use their own trained
+    weights but share this decoder — same design as meta/predictor.py.
+    Housing is inverted (1 − pred) before aggregation; raw housing_score stored
+    in metadata still reflects building presence.
+  - Passes 2-4 re-score vegetation / housing / elevation with their own trained
+    decoders, overwriting the Pass 1 estimates with more accurate values.
+  - Any submodel whose checkpoint is missing is skipped gracefully.
   - Elevation uses synthetic DEM (--use-real-dem not supported here for speed).
 """
 
@@ -80,20 +82,25 @@ from submodels.complexity.model    import ComplexityBalanceNet  # noqa: E402
 from meta.model                    import AestheticAggregator   # noqa: E402
 
 
-# Ordered to match SUBMODEL_NAMES in meta/model.py
-_AESTHETIC_REGISTRY = [
-    ("fractal_score",    FractalPatternNet,    "fractal"),
-    ("water_score",      WaterGeometryNet,     "water"),
-    ("color_score",      ColorHarmonyNet,      "color_harmony"),
-    ("symmetry_score",   SymmetryOrderNet,     "symmetry"),
-    ("sublime_score",    ScaleSublimeNet,      "sublime"),
-    ("complexity_score", ComplexityBalanceNet, "complexity"),
+# Mirrors _SUBMODEL_REGISTRY in meta/predictor.py.
+# (score_key, class, checkpoint_subdir, invert_for_aggregator)
+# invert=True → aggregator receives (1 − pred); stored score_key stays raw.
+_SUBMODEL_REGISTRY = [
+    ("fractal_score",    FractalPatternNet,    "fractal",       False),
+    ("water_score",      WaterGeometryNet,     "water",         False),
+    ("color_score",      ColorHarmonyNet,      "color_harmony", False),
+    ("symmetry_score",   SymmetryOrderNet,     "symmetry",      False),
+    ("sublime_score",    ScaleSublimeNet,      "sublime",       False),
+    ("complexity_score", ComplexityBalanceNet, "complexity",    False),
+    ("vegetation_score", TransUNet,            "vegetation",    False),
+    ("terrain_score",    ElevationPOITransUNet,"elevation",     False),
+    ("housing_score",    HousingEdgeCNN,       "housing",       True),  # → urban_openness
 ]
 
 _ALL_SCORE_KEYS = [
-    "vegetation_score", "housing_score", "terrain_score",
     "fractal_score", "water_score", "color_score",
     "symmetry_score", "sublime_score", "complexity_score",
+    "vegetation_score", "terrain_score", "housing_score",
     "aesthetic_score",
 ]
 
@@ -128,38 +135,43 @@ def _load_head(model_class, ckpt_path: Path, device):
 @torch.no_grad()
 def _aesthetic_pass(core, ckpt_dir: Path, records: Dict,
                     loaders, device) -> None:
-    """Pass 1 — CLS embeddings + all 6 aesthetic scores + meta aggregator score.
+    """Pass 1 — CLS embeddings + all 9 submodel scores + meta aggregator score.
 
-    Uses a single shared decoder (from the first available aesthetic checkpoint),
-    consistent with how meta/predictor.py runs the pipeline.
+    All 9 submodels are treated equally. The decoder is loaded from the first
+    available checkpoint in registry order. Housing is inverted (urban_openness
+    = 1 − pred) before aggregation; housing_score stored in records stays raw.
+    Passes 2–4 overwrite the geo scores with more accurate per-decoder values.
     """
-    print("\n[Pass 1] Aesthetic submodels + CLS embeddings")
+    print("\n[Pass 1] All 9 submodels + CLS embeddings + meta aggregator")
 
-    # Load one decoder for all aesthetic submodels (first available wins)
+    # Load decoder from first available checkpoint (registry order = priority)
     decoder_loaded = False
-    for _, _, subdir in _AESTHETIC_REGISTRY:
+    for _, _, subdir, _ in _SUBMODEL_REGISTRY:
         if _load_decoder(ckpt_dir / subdir / "best_model.pth", core, device):
             print(f"    Decoder loaded from: {subdir}/best_model.pth")
             decoder_loaded = True
             break
     if not decoder_loaded:
-        print("    WARNING: no aesthetic checkpoint found — using uninitialised decoder")
+        print("    WARNING: no checkpoint found — using uninitialised decoder")
 
-    # Load all 6 aesthetic task heads
+    # Load all 9 task heads
     heads = []
-    for score_key, cls, subdir in _AESTHETIC_REGISTRY:
+    for score_key, cls, subdir, _ in _SUBMODEL_REGISTRY:
         head = _load_head(cls, ckpt_dir / subdir / "best_model.pth", device)
         heads.append((score_key, head))
 
-    # Load meta aggregator (optional)
-    aggregator = AestheticAggregator(n_submodels=6).to(device)
+    # Load meta aggregator (9 inputs)
+    aggregator = AestheticAggregator(n_submodels=9).to(device)
     agg_path   = ckpt_dir / "meta" / "best_model.pth"
     if agg_path.exists():
         agg_ckpt = torch.load(agg_path, map_location=device, weights_only=True)
-        aggregator.load_state_dict(agg_ckpt["aggregator_state_dict"])
-        print("    Aggregator loaded from: meta/best_model.pth")
+        try:
+            aggregator.load_state_dict(agg_ckpt["aggregator_state_dict"])
+            print("    Aggregator loaded from: meta/best_model.pth")
+        except RuntimeError:
+            print("    WARNING: meta checkpoint incompatible — using equal weights")
     else:
-        print("    WARNING: no meta checkpoint — aggregator uses equal weights")
+        print("    WARNING: no meta checkpoint — using equal weights")
     aggregator.eval()
     core.decoder.eval()
 
@@ -167,39 +179,41 @@ def _aesthetic_pass(core, ckpt_dir: Path, records: Dict,
         for inputs, _targets, metas in tqdm(loader,
                                             desc=f"  aesthetic [{split_name}]"):
             inputs  = inputs.to(device)
-            rgb_in  = inputs[:, :3]
+            B       = inputs.size(0)
 
-            features    = core.extract_features(rgb_in)
+            features    = core.extract_features(inputs[:, :3])
             feature_map = core.decode(features)
             embs        = F.normalize(features["cls"], p=2, dim=1)  # (B, 384)
 
-            # Run all 6 aesthetic heads
-            maps = []
-            for _, head in heads:
+            # All 9 heads — uniform call; housing inverted for aggregation
+            raw_preds = []
+            maps      = []
+            for (_, _, _, invert), (_, head) in zip(_SUBMODEL_REGISTRY, heads):
                 pred = head(feature_map) if head is not None else \
-                       torch.zeros(inputs.size(0), 1, 64, 64, device=device)
-                maps.append(pred)
+                       torch.zeros(B, 1, 64, 64, device=device)
+                raw_preds.append(pred)
+                maps.append(1.0 - pred if invert else pred)
 
-            heatmaps  = torch.cat(maps, dim=1)              # (B, 6, H, W)
-            aesthetic = aggregator(heatmaps)                 # (B, 1, H, W)
-            weights   = aggregator.channel_weights(heatmaps) # (B, 6)
+            heatmaps  = torch.cat(maps, dim=1)               # (B, 9, H, W)
+            aesthetic = aggregator(heatmaps)                  # (B, 1, H, W)
+            weights   = aggregator.channel_weights(heatmaps)  # (B, 9)
 
             embs_np      = embs.cpu().numpy()
-            heatmaps_np  = heatmaps.cpu().numpy()
             aesthetic_np = aesthetic.cpu().numpy()
             weights_np   = weights.cpu().numpy()
 
-            for i in range(inputs.size(0)):
+            for i in range(B):
                 fp = metas[i]["filepath"]
                 records[fp] = {
                     "filepath":          fp,
                     "class_name":        metas[i]["class_name"],
                     "cls_embedding":     embs_np[i].tolist(),
                     "aesthetic_score":   float(aesthetic_np[i, 0].mean()),
-                    "aesthetic_weights": weights_np[i].tolist(),
+                    "aesthetic_weights": weights_np[i].tolist(),   # 9 weights
                 }
-                for j, (score_key, _) in enumerate(heads):
-                    records[fp][score_key] = float(heatmaps_np[i, j].mean())
+                # Store raw scores (housing stored as building presence, not inverted)
+                for j, (score_key, _, _, _) in enumerate(_SUBMODEL_REGISTRY):
+                    records[fp][score_key] = float(raw_preds[j][i, 0].mean())
 
 
 @torch.no_grad()
@@ -354,7 +368,7 @@ def main() -> None:
 
     records: Dict[str, dict] = {}
 
-    # ── Pass 1: CLS embeddings + 6 aesthetic scores + meta ────────────────────
+    # ── Pass 1: CLS embeddings + all 9 submodel scores + meta aggregator ────────
     _aesthetic_pass(core, ckpt_dir, records, rgb_loaders, device)
     print(f"\n  Tiles collected: {len(records)}")
 

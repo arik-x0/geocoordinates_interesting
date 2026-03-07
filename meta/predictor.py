@@ -1,5 +1,10 @@
 """
-AestheticPredictor: runs all 6 aesthetic submodels + aggregator in one pipeline.
+AestheticPredictor: runs all 9 submodels + aggregator in one pipeline.
+
+All 9 submodels are treated as equal members of the aesthetic pipeline.
+Each is loaded from its own checkpoint and called as submodel(feature_map).
+The elevation model accepts topo=None (auto-zeros), so all 9 share the same
+call signature at inference time.
 
 Usage:
     python -m meta predict \\
@@ -8,14 +13,22 @@ Usage:
         --output-dir output/aesthetic \\
         --top-n 20
 
-Checkpoint layout expected:
-    checkpoints/fractal/best_model.pth
-    checkpoints/water/best_model.pth
-    checkpoints/color_harmony/best_model.pth
-    checkpoints/symmetry/best_model.pth
-    checkpoints/sublime/best_model.pth
-    checkpoints/complexity/best_model.pth
-    checkpoints/meta/best_model.pth       (optional)
+Checkpoint layout:
+    checkpoints/<subdir>/best_model.pth  for each entry in _SUBMODEL_REGISTRY
+
+Shared decoder:
+    All 9 submodels run against one decoder state, loaded from the first
+    available checkpoint in registry order. This trades per-submodel
+    decoder accuracy for a single-pass pipeline — a deliberate design
+    choice since all decoders converge toward the same satellite features.
+
+Housing inversion (urban_openness):
+    The housing model predicts building *presence*. The registry marks it
+    with invert=True, so the pipeline feeds (1 − housing_pred) to the
+    aggregator as an "urban openness" signal. Attention Restoration Theory:
+    dense built environments increase cognitive load and reduce aesthetic
+    experience. The raw housing_score in VectorDB metadata still reflects
+    building presence for standalone use.
 """
 
 import sys
@@ -23,7 +36,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from tqdm import tqdm
@@ -32,32 +44,45 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.model import CoreSatelliteModel                       # noqa: E402
 from dataset import get_fractal_dataloaders                    # noqa: E402
 
-from submodels.fractal.model    import FractalPatternNet
-from submodels.water.model      import WaterGeometryNet
+from submodels.fractal.model       import FractalPatternNet
+from submodels.water.model         import WaterGeometryNet
 from submodels.color_harmony.model import ColorHarmonyNet
-from submodels.symmetry.model   import SymmetryOrderNet
-from submodels.sublime.model    import ScaleSublimeNet
-from submodels.complexity.model import ComplexityBalanceNet
+from submodels.symmetry.model      import SymmetryOrderNet
+from submodels.sublime.model       import ScaleSublimeNet
+from submodels.complexity.model    import ComplexityBalanceNet
+from submodels.vegetation.model    import TransUNet
+from submodels.elevation.model     import ElevationPOITransUNet
+from submodels.housing.model       import HousingEdgeCNN
 from .model import AestheticAggregator, SUBMODEL_NAMES
 
-# Submodel registry: (name, class, checkpoint-subdir)
+# Single unified registry: (name, class, checkpoint_subdir, invert_for_aggregator)
+# All 9 submodels are equals. The decoder is loaded from the first checkpoint
+# that contains one (registry order = priority).
+# invert=True  →  aggregator receives (1 − pred)  [housing → urban_openness]
+# invert=False →  aggregator receives pred directly
 _SUBMODEL_REGISTRY = [
-    ("fractal",       FractalPatternNet,    "fractal"),
-    ("water",         WaterGeometryNet,     "water"),
-    ("color_harmony", ColorHarmonyNet,      "color_harmony"),
-    ("symmetry",      SymmetryOrderNet,     "symmetry"),
-    ("sublime",       ScaleSublimeNet,      "sublime"),
-    ("complexity",    ComplexityBalanceNet, "complexity"),
+    ("fractal",       FractalPatternNet,     "fractal",       False),
+    ("water",         WaterGeometryNet,      "water",         False),
+    ("color_harmony", ColorHarmonyNet,       "color_harmony", False),
+    ("symmetry",      SymmetryOrderNet,      "symmetry",      False),
+    ("sublime",       ScaleSublimeNet,       "sublime",       False),
+    ("complexity",    ComplexityBalanceNet,  "complexity",    False),
+    ("vegetation",    TransUNet,             "vegetation",    False),
+    ("elevation",     ElevationPOITransUNet, "elevation",     False),
+    ("housing",       HousingEdgeCNN,        "housing",       True),  # → urban_openness
 ]
 
 
 def _load_submodel(cls, ckpt_path: Path, core, device):
-    """Instantiate, load weights, and return an eval-mode submodel."""
+    """Instantiate, load weights, and return an eval-mode submodel.
+
+    Loads the shared decoder from the checkpoint on the first call that
+    provides one. All subsequent calls skip decoder loading (flag on core).
+    """
     model = cls(out_channels=1).to(device)
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["submodel_state_dict"])
-        # Load decoder once from the first valid checkpoint
         if "decoder_state_dict" in ckpt and not getattr(core, "_decoder_loaded", False):
             core.decoder.load_state_dict(ckpt["decoder_state_dict"])
             core._decoder_loaded = True
@@ -69,7 +94,7 @@ def _load_submodel(cls, ckpt_path: Path, core, device):
 
 
 class AestheticPredictor:
-    """Run all 6 submodels + aggregator and produce a ranked aesthetic output."""
+    """Run all 9 submodels + aggregator and produce a ranked aesthetic output."""
 
     def __init__(self, args):
         self.args = args
@@ -80,32 +105,42 @@ class AestheticPredictor:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
-        ckpt_dir  = Path(args.checkpoint_dir)
+        ckpt_dir   = Path(args.checkpoint_dir)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load core model
         core = CoreSatelliteModel().freeze().to(device)
         core._decoder_loaded = False
 
-        # Load all 6 submodels
+        # Load all 9 submodels — uniform loop, one decoder loaded from first hit
+        print("\nLoading all 9 submodels...")
         submodels = {}
-        for name, cls, subdir in _SUBMODEL_REGISTRY:
-            ckpt_path = ckpt_dir / subdir / "best_model.pth"
-            submodels[name] = _load_submodel(cls, ckpt_path, core, device)
+        for name, cls, subdir, _ in _SUBMODEL_REGISTRY:
+            submodels[name] = _load_submodel(cls, ckpt_dir / subdir / "best_model.pth",
+                                              core, device)
 
-        # Load aggregator (optional)
-        aggregator = AestheticAggregator(n_submodels=6).to(device)
+        if not core._decoder_loaded:
+            print("  WARNING: no checkpoint had a decoder_state_dict — "
+                  "using randomly initialised decoder")
+
+        # Load aggregator (9 inputs)
+        aggregator = AestheticAggregator(n_submodels=9).to(device)
         agg_ckpt   = ckpt_dir / "meta" / "best_model.pth"
         if agg_ckpt.exists():
             agg_state = torch.load(agg_ckpt, map_location=device, weights_only=True)
-            aggregator.load_state_dict(agg_state["aggregator_state_dict"])
-            print(f"  Loaded AestheticAggregator from {agg_ckpt}")
+            try:
+                aggregator.load_state_dict(agg_state["aggregator_state_dict"])
+                print(f"\n  Loaded AestheticAggregator from {agg_ckpt}")
+            except RuntimeError:
+                print("\n  WARNING: meta checkpoint was trained with fewer submodels — "
+                      "retrain: python -m meta train")
+                print("  Continuing with equal weights (untrained aggregator).")
         else:
-            print("  No aggregator checkpoint — using equal weights (untrained)")
+            print("\n  No aggregator checkpoint — using equal weights (untrained)")
         aggregator.eval()
+        core.decoder.eval()
 
-        # Use fractal dataloader as proxy (same EuroSAT images, all tasks share it)
+        # Fractal dataloader = all EuroSAT tiles, RGB only
         _, _, test_loader = get_fractal_dataloaders(
             data_dir=Path(args.data_dir),
             batch_size=args.batch_size,
@@ -113,36 +148,35 @@ class AestheticPredictor:
         )
 
         all_results = []
-        print("\nRunning aesthetic pipeline...")
+        print("\nRunning aesthetic pipeline (9 submodels)...")
         for inputs, _targets, metas in tqdm(test_loader, desc="Aesthetic"):
             inputs  = inputs.to(device)
-            rgb_in  = inputs[:, :3]               # first 3 channels = RGB
+            B       = inputs.size(0)
 
-            features    = core.extract_features(rgb_in)
+            features    = core.extract_features(inputs[:, :3])
             feature_map = core.decode(features)
 
-            # Run all 6 submodels
+            # All 9 submodels — uniform call, housing inverted to urban_openness
             maps = []
-            for name, _, _ in _SUBMODEL_REGISTRY:
-                pred = submodels[name](feature_map)  # (B, 1, H, W)
-                maps.append(pred)
+            for name, _, _, invert in _SUBMODEL_REGISTRY:
+                pred = submodels[name](feature_map)          # (B, 1, H, W)
+                maps.append(1.0 - pred if invert else pred)
 
-            heatmaps  = torch.cat(maps, dim=1)       # (B, 6, H, W)
-            aesthetic  = aggregator(heatmaps)         # (B, 1, H, W)
+            heatmaps  = torch.cat(maps, dim=1)        # (B, 9, H, W)
+            aesthetic = aggregator(heatmaps)           # (B, 1, H, W)
 
             inputs_cpu  = inputs.cpu().numpy()
             aes_cpu     = aesthetic.cpu().numpy()
             maps_cpu    = heatmaps.cpu().numpy()
             weights_cpu = aggregator.channel_weights(heatmaps).cpu().numpy()
 
-            for i in range(inputs.size(0)):
-                score = float(aes_cpu[i, 0].mean())
+            for i in range(B):
                 all_results.append({
                     "rgb":             inputs_cpu[i, :3],
                     "aesthetic_map":   aes_cpu[i, 0],
-                    "submodel_maps":   maps_cpu[i],       # (6, H, W)
-                    "channel_weights": weights_cpu[i],    # (6,)
-                    "aesthetic_score": score,
+                    "submodel_maps":   maps_cpu[i],       # (9, H, W); housing ch = urban_openness
+                    "channel_weights": weights_cpu[i],    # (9,)
+                    "aesthetic_score": float(aes_cpu[i, 0].mean()),
                     "class_name":      metas[i]["class_name"],
                     "filepath":        metas[i]["filepath"],
                 })
@@ -158,18 +192,18 @@ class AestheticPredictor:
     def _print_ranking(self, results, top_n):
         n      = len(results)
         scores = [r["aesthetic_score"] for r in results]
-        print(f"\n{'='*75}")
-        print(f"  AESTHETIC RANKING (meta aggregator) -- Top {min(top_n, n)} of {n}")
-        print(f"{'='*75}")
+        print(f"\n{'='*80}")
+        print(f"  AESTHETIC RANKING (9 submodels) -- Top {min(top_n, n)} of {n}")
+        print(f"{'='*80}")
         header = f"  {'Rank':<5} {'Score':<8} {'Class':<22}"
         for name in SUBMODEL_NAMES:
-            header += f" {name[:7]:>7}"
+            header += f" {name[:6]:>6}"
         print(header)
         print("  " + "-" * (len(header) - 2))
         for rank, r in enumerate(results[:top_n], 1):
             row = f"  {rank:<5} {r['aesthetic_score']:<8.4f} {r['class_name']:<22}"
             for w in r["channel_weights"]:
-                row += f" {w:>7.3f}"
+                row += f" {w:>6.3f}"
             print(row)
         print(f"\n  Mean: {np.mean(scores):.4f}  Max: {np.max(scores):.4f}")
 
@@ -190,38 +224,47 @@ class AestheticPredictor:
             rgb = np.transpose(np.clip(r["rgb"], 0, 1), (1, 2, 0))
             aes = r["aesthetic_map"]
 
-            fig, axes = plt.subplots(2, 4, figsize=(22, 11))
+            # 3×4 grid: RGB + 9 submodel heatmaps + blank + aesthetic overlay
+            fig, axes = plt.subplots(3, 4, figsize=(22, 17))
             fig.patch.set_facecolor("#0d0d0d")
 
-            # Row 0: RGB + 3 top submodel maps
+            # Row 0: RGB | fractal | water | color_harmony (indices 0-2)
             axes[0, 0].imshow(rgb)
             axes[0, 0].set_title("Satellite RGB", color="white")
             axes[0, 0].axis("off")
-
-            for col, (name, w) in enumerate(
-                zip(SUBMODEL_NAMES[:3], r["channel_weights"][:3]), 1
-            ):
-                axes[0, col].imshow(r["submodel_maps"][col - 1], cmap=cmap, vmin=0, vmax=1)
-                axes[0, col].set_title(f"{name}\nw={w:.3f}", color="white", fontsize=9)
+            for col, idx in enumerate([0, 1, 2], 1):
+                axes[0, col].imshow(r["submodel_maps"][idx], cmap=cmap, vmin=0, vmax=1)
+                axes[0, col].set_title(
+                    f"{SUBMODEL_NAMES[idx]}\nw={r['channel_weights'][idx]:.3f}",
+                    color="white", fontsize=9)
                 axes[0, col].axis("off")
 
-            # Row 1: 3 remaining submodel maps + aesthetic fusion
-            for col, (name, w) in enumerate(
-                zip(SUBMODEL_NAMES[3:], r["channel_weights"][3:]), 0
-            ):
-                axes[1, col].imshow(r["submodel_maps"][col + 3], cmap=cmap, vmin=0, vmax=1)
-                axes[1, col].set_title(f"{name}\nw={w:.3f}", color="white", fontsize=9)
+            # Row 1: symmetry | sublime | complexity | vegetation (indices 3-6)
+            for col, idx in enumerate([3, 4, 5, 6]):
+                axes[1, col].imshow(r["submodel_maps"][idx], cmap=cmap, vmin=0, vmax=1)
+                axes[1, col].set_title(
+                    f"{SUBMODEL_NAMES[idx]}\nw={r['channel_weights'][idx]:.3f}",
+                    color="white", fontsize=9)
                 axes[1, col].axis("off")
 
-            # Aesthetic overlay on RGB
+            # Row 2: elevation | urban_openness | blank | aesthetic overlay (indices 7-8)
+            for col, idx in enumerate([7, 8]):
+                axes[2, col].imshow(r["submodel_maps"][idx], cmap=cmap, vmin=0, vmax=1)
+                axes[2, col].set_title(
+                    f"{SUBMODEL_NAMES[idx]}\nw={r['channel_weights'][idx]:.3f}",
+                    color="white", fontsize=9)
+                axes[2, col].axis("off")
+
+            axes[2, 2].axis("off")   # blank panel
+
             overlay = rgb.copy()
             overlay[:, :, 0] = np.clip(overlay[:, :, 0] + aes * 0.5, 0, 1)
             overlay[:, :, 2] = np.clip(overlay[:, :, 2] * (1 - aes * 0.3), 0, 1)
-            axes[1, 3].imshow(overlay)
-            axes[1, 3].set_title(
+            axes[2, 3].imshow(overlay)
+            axes[2, 3].set_title(
                 f"Aesthetic Fusion\nscore={r['aesthetic_score']:.4f}",
                 color="white", fontsize=9)
-            axes[1, 3].axis("off")
+            axes[2, 3].axis("off")
 
             for ax in axes.flat:
                 ax.set_facecolor("#0d0d0d")
