@@ -48,6 +48,7 @@ if _ROOT_STR not in sys.path:
 from constants import (  # noqa: E402
     BAND_RED, BAND_GREEN, BAND_BLUE, BAND_NIR,
     NDVI_GREENERY_THRESHOLD,
+    PRITHVI_BAND_INDICES, PRITHVI_MEAN, PRITHVI_STD,
 )
 
 
@@ -65,6 +66,26 @@ def _load_subutils(subdir: str):
 _veg_utils   = _load_subutils("submodels/vegetation")
 _elev_utils  = _load_subutils("submodels/elevation")
 _house_utils = _load_subutils("submodels/housing")
+
+# ── Prithvi band extractor ────────────────────────────────────────────────────
+
+def extract_prithvi_bands(all_bands: np.ndarray) -> np.ndarray:
+    """Extract and normalise the 6 HLS bands expected by Prithvi-EO-1.0-100M.
+
+    Args:
+        all_bands: (13, H, W) raw EuroSAT Sentinel-2 raster (DN values ×10000).
+
+    Returns:
+        (6, H, W) float32 tensor normalised by Prithvi's per-band mean/std.
+        Channel order: [B02(Blue), B03(Green), B04(Red), B8A(NIR-N), B11(SWIR1), B12(SWIR2)]
+    """
+    bands = np.stack(
+        [all_bands[i] for i in PRITHVI_BAND_INDICES], axis=0
+    ).astype(np.float32)                                         # (6, H, W)
+    mean = np.array(PRITHVI_MEAN, dtype=np.float32)[:, None, None]
+    std  = np.array(PRITHVI_STD,  dtype=np.float32)[:, None, None]
+    return (bands - mean) / std
+
 
 # ── Vegetation helpers ────────────────────────────────────────────────────────
 extract_rgb             = _elev_utils.extract_rgb
@@ -187,12 +208,12 @@ def get_dem_for_tile(
 # ── Dataset classes ───────────────────────────────────────────────────────────
 
 class EuroSATGreeneryDataset(Dataset):
-    """Produces (RGB, NDVI mask, meta) triples for vegetation segmentation.
+    """Produces (prithvi_6band, NDVI mask, meta) triples for vegetation segmentation.
 
     Each sample:
-        rgb:  Tensor (3, 64, 64) — normalised RGB
-        mask: Tensor (1, 64, 64) — binary NDVI greenery mask
-        meta: dict — filepath, class_name, ndvi_mean
+        prithvi: Tensor (6, 64, 64) — Prithvi-normalised 6-band HLS input
+        mask:    Tensor (1, 64, 64) — binary NDVI greenery mask
+        meta:    dict — filepath, class_name, ndvi_mean
     """
 
     def __init__(self, root_dir: Path,
@@ -225,34 +246,38 @@ class EuroSATGreeneryDataset(Dataset):
         with rasterio.open(filepath) as src:
             all_bands = src.read()  # (13, 64, 64)
 
-        rgb  = extract_rgb(all_bands)  # (3, 64, 64)
+        prithvi = extract_prithvi_bands(all_bands)   # (6, 64, 64)
         red  = all_bands[BAND_RED].astype(np.float32)
         nir  = all_bands[BAND_NIR].astype(np.float32)
         ndvi = compute_ndvi(red, nir)
         mask = ndvi_to_mask(ndvi, self.ndvi_threshold)  # (64, 64)
 
-        rgb_tensor  = torch.from_numpy(rgb).float()
-        mask_tensor = torch.from_numpy(mask).unsqueeze(0).float()
+        prithvi_tensor = torch.from_numpy(prithvi).float()
+        mask_tensor    = torch.from_numpy(mask).unsqueeze(0).float()
 
         if self.transform:
-            rgb_tensor, mask_tensor = self.transform(rgb_tensor, mask_tensor)
+            prithvi_tensor, mask_tensor = self.transform(prithvi_tensor, mask_tensor)
 
         meta = {
             "filepath":   str(filepath),
             "class_name": class_name,
             "ndvi_mean":  float(ndvi.mean()),
         }
-        return rgb_tensor, mask_tensor, meta
+        return prithvi_tensor, mask_tensor, meta
 
 
 class ElevationPOIDataset(Dataset):
-    """Produces (6-channel input, terrain heatmap, meta) for terrain beauty detection.
+    """Produces (9-channel input, terrain heatmap, meta) for terrain beauty detection.
 
     Pseudo-label: topographic ruggedness (local relief + slope variance +
     ridgeline curvature) — independent of water, based on SBE research.
 
     Each sample:
-        input_tensor: Tensor (6, 64, 64) — RGB + DEM + Slope + Aspect
+        input_tensor: Tensor (9, 64, 64) — 6 Prithvi bands + DEM + Slope + Aspect
+                          ch 0-5: Prithvi-normalised HLS bands (passed to backbone)
+                          ch 6:   DEM (normalised)
+                          ch 7:   Slope (normalised)
+                          ch 8:   Aspect (normalised 0-1)
         target:       Tensor (1, 64, 64) — terrain beauty heatmap
         meta:         dict — filepath, class_name, terrain_score,
                              max_slope, dem_source
@@ -287,7 +312,7 @@ class ElevationPOIDataset(Dataset):
             all_bands = src.read()  # (13, 64, 64)
 
         h, w = all_bands.shape[1], all_bands.shape[2]
-        rgb  = extract_rgb(all_bands)  # (3, 64, 64)
+        prithvi = extract_prithvi_bands(all_bands)   # (6, 64, 64)
 
         import warnings
         dem = None
@@ -313,14 +338,14 @@ class ElevationPOIDataset(Dataset):
         slope_norm  = normalize_channel(slope)
         aspect_norm = aspect / (2 * np.pi)
 
-        input_6ch = np.concatenate([
-            rgb,
+        input_9ch = np.concatenate([
+            prithvi,
             dem_norm[np.newaxis, :, :],
             slope_norm[np.newaxis, :, :],
             aspect_norm[np.newaxis, :, :],
-        ], axis=0)  # (6, 64, 64)
+        ], axis=0)  # (9, 64, 64): ch0-5=Prithvi, ch6=DEM, ch7=Slope, ch8=Aspect
 
-        input_tensor  = torch.from_numpy(input_6ch).float()
+        input_tensor  = torch.from_numpy(input_9ch).float()
         target_tensor = torch.from_numpy(terrain_heatmap[np.newaxis, :, :]).float()
 
         meta = {
@@ -334,16 +359,16 @@ class ElevationPOIDataset(Dataset):
 
 
 class EuroSATHousingDataset(Dataset):
-    """Produces (RGB, structure label, meta) for housing density detection.
+    """Produces (prithvi_6band, structure label, meta) for housing density detection.
 
     Ground-truth labels are generated from NDBI + Sobel gradient — no manual
     annotations required.
 
     Each sample:
-        rgb:   Tensor (3, 64, 64) — normalised RGB
-        label: Tensor (1, 64, 64) — binary built-up / structure mask
-        meta:  dict — filepath, class_name, housing_score, is_residential,
-                      ndbi_mean
+        prithvi: Tensor (6, 64, 64) — Prithvi-normalised 6-band HLS input
+        label:   Tensor (1, 64, 64) — binary built-up / structure mask
+        meta:    dict — filepath, class_name, housing_score, is_residential,
+                        ndbi_mean
     """
 
     BUILT_UP_CLASSES = {"Residential", "Industrial", "Highway"}
@@ -375,15 +400,15 @@ class EuroSATHousingDataset(Dataset):
         with rasterio.open(filepath) as src:
             all_bands = src.read()  # (13, 64, 64)
 
-        rgb           = extract_rgb(all_bands)
+        prithvi       = extract_prithvi_bands(all_bands)     # (6, 64, 64)
         label         = generate_structure_label(all_bands)  # (64, 64)
         housing_score = float(label.mean())
 
-        rgb_tensor   = torch.from_numpy(rgb).float()
-        label_tensor = torch.from_numpy(label).unsqueeze(0).float()
+        prithvi_tensor = torch.from_numpy(prithvi).float()
+        label_tensor   = torch.from_numpy(label).unsqueeze(0).float()
 
         if self.transform:
-            rgb_tensor, label_tensor = self.transform(rgb_tensor, label_tensor)
+            prithvi_tensor, label_tensor = self.transform(prithvi_tensor, label_tensor)
 
         nir  = all_bands[7].astype(np.float32)
         swir = all_bands[10].astype(np.float32)
@@ -399,7 +424,7 @@ class EuroSATHousingDataset(Dataset):
             "is_residential": class_name in self.BUILT_UP_CLASSES,
             "ndbi_mean":      ndbi_mean,
         }
-        return rgb_tensor, label_tensor, meta
+        return prithvi_tensor, label_tensor, meta
 
 
 # ── DataLoader factories ──────────────────────────────────────────────────────
@@ -495,7 +520,7 @@ class _AestheticDataset(Dataset):
     """Base for all 6 aesthetic submodels — reads EuroSAT, generates pseudo-labels.
 
     Subclasses implement _make_label(all_bands, idx) -> np.ndarray (H, W) in [0,1].
-    Input tensor is always (3, 64, 64) normalised RGB.
+    Input tensor is always (6, 64, 64) Prithvi-normalised HLS bands.
     Target tensor is (1, 64, 64) soft heatmap.
     """
 
@@ -525,8 +550,8 @@ class _AestheticDataset(Dataset):
         with rasterio.open(filepath) as src:
             all_bands = src.read()   # (13, 64, 64)
 
-        rgb   = extract_rgb(all_bands)          # (3, 64, 64) float32 [0,1]
-        label = self._make_label(all_bands, idx) # (64, 64)   float32 [0,1]
+        prithvi = extract_prithvi_bands(all_bands)   # (6, 64, 64) float32
+        label   = self._make_label(all_bands, idx)   # (64, 64)    float32 [0,1]
 
         meta = {
             "filepath":    str(filepath),
@@ -534,7 +559,7 @@ class _AestheticDataset(Dataset):
             "label_mean":  float(label.mean()),
         }
         return (
-            torch.from_numpy(rgb).float(),
+            torch.from_numpy(prithvi).float(),
             torch.from_numpy(label).unsqueeze(0).float(),
             meta,
         )

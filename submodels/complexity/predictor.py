@@ -28,7 +28,7 @@ class ComplexityPredictor(BasePredictor):
 
     def build_result(self, i, inputs_cpu, targets_cpu, preds_cpu, metas, embs_cpu):
         return {
-            "rgb":               inputs_cpu[i],
+            "rgb":               inputs_cpu[i, [2, 1, 0]],   # R=ch2(B04), G=ch1(B03), B=ch0(B02)
             "label_true":        targets_cpu[i, 0],
             "label_pred":        preds_cpu[i, 0],
             "complexity_score":  compute_complexity_score(preds_cpu[i, 0]),

@@ -33,13 +33,13 @@ class ElevationTrainer(BaseTrainer):
         return HeatmapLoss(mse_weight=0.5, dice_weight=0.5)
 
     def rgb_slice(self, inputs):
-        return inputs[:, :3]
+        return inputs[:, :6]   # Prithvi 6-band input (ch 0-5)
 
     def extra_slice(self, inputs):
-        return inputs[:, 3:]
+        return inputs[:, 6:]   # topo channels: DEM, Slope, Aspect (ch 6-8)
 
     def get_encode_fn(self, core):
-        return lambda x: core.encode(x[:, :3])
+        return lambda x: core.encode(x[:, :6])
 
     @classmethod
     def add_args(cls, parser):

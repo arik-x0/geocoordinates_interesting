@@ -153,7 +153,7 @@ class AestheticPredictor:
             inputs  = inputs.to(device)
             B       = inputs.size(0)
 
-            features    = core.extract_features(inputs[:, :3])
+            features    = core.extract_features(inputs)   # full 6-band Prithvi input
             feature_map = core.decode(features)
 
             # All 9 submodels — uniform call, housing inverted to urban_openness
@@ -172,7 +172,7 @@ class AestheticPredictor:
 
             for i in range(B):
                 all_results.append({
-                    "rgb":             inputs_cpu[i, :3],
+                    "rgb":             inputs_cpu[i, [2, 1, 0]],   # R=ch2(B04), G=ch1(B03), B=ch0(B02)
                     "aesthetic_map":   aes_cpu[i, 0],
                     "submodel_maps":   maps_cpu[i],       # (9, H, W); housing ch = urban_openness
                     "channel_weights": weights_cpu[i],    # (9,)

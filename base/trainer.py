@@ -176,7 +176,7 @@ class BaseTrainer:
         print("\n--- Loading Dataset ---")
         train_loader, val_loader, test_loader = self.get_dataloaders()
 
-        print("\n--- Loading Core Model (DINO ViT-S/16 backbone, frozen) ---")
+        print("\n--- Loading Core Model (Prithvi-EO-1.0-100M backbone, frozen) ---")
         core = CoreSatelliteModel().freeze().to(device)
         backbone_params = sum(p.numel() for p in core.backbone.parameters())
         decoder_params  = sum(p.numel() for p in core.decoder.parameters())

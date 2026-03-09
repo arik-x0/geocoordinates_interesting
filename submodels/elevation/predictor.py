@@ -34,19 +34,19 @@ class ElevationPredictor(BasePredictor):
         return ElevationPOITransUNet(out_channels=1)
 
     def rgb_slice(self, inputs):
-        return inputs[:, :3]
+        return inputs[:, :6]   # Prithvi 6-band input (ch 0-5)
 
     def extra_slice(self, inputs):
-        return inputs[:, 3:]   # DEM + slope + aspect topo channels
+        return inputs[:, 6:]   # topo channels: DEM, Slope, Aspect (ch 6-8)
 
     def build_result(self, i, inputs_cpu, targets_cpu, preds_cpu, metas, embs_cpu):
-        dem   = inputs_cpu[i, 3]
-        slope = inputs_cpu[i, 4]
+        dem   = inputs_cpu[i, 6]   # ch6: DEM  (after 6 Prithvi bands)
+        slope = inputs_cpu[i, 7]   # ch7: Slope
         dem_norm  = normalize_channel(dem)
         local_relief = maximum_filter(dem_norm, size=TERRAIN_RELIEF_WINDOW) \
                      - minimum_filter(dem_norm, size=TERRAIN_RELIEF_WINDOW)
         return {
-            "rgb":           inputs_cpu[i, :3],
+            "rgb":           inputs_cpu[i, [2, 1, 0]],   # R=ch2(B04), G=ch1(B03), B=ch0(B02)
             "dem":           dem,
             "slope":         slope,
             "local_relief":  local_relief,
